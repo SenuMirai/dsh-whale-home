@@ -1,0 +1,71 @@
+{
+  "name": "dsh-qq-group",
+  "version": "1.52.0",
+  "description": "独立的 DSH QQ 群聊插件：人设、主动/被动搭话、DSH 模型选择；与桌宠数据/记忆完全分开",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "resources",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-client-connection": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "xlsx": "^0.18.5",
+    "pdfjs-dist": "^4.10.38"
+  },
+  "devDependencies": {
+    "tsdown": "^0.8.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "watch": "tsdown --watch",
+    "test:memory": "node tests/memory-v3.test.mjs",
+    "test:proactive": "node tests/proactive.test.mjs",
+    "test:mood": "node tests/mood.test.mjs",
+    "test:voice": "node tests/voice-trigger.test.mjs",
+    "test:reply": "node tests/reply-plan.test.mjs",
+    "test:private": "node tests/private.test.mjs",
+    "test": "npm run test:memory && npm run test:memory-center && npm run test:decision && npm run test:dedupe && npm run test:safety && npm run test:persona && npm run test:speech && npm run test:safetydoc && npm run test:proactive && npm run test:mood && npm run test:voice && npm run test:reply && npm run test:private",
+    "patches:verify": "node patches/verify.mjs",
+    "patches:apply": "node patches/apply.mjs",
+    "patches:check": "node patches/apply.mjs --check",
+    "test:memory-center": "node tests/memory-center.test.mjs",
+    "test:decision": "node tests/decision.test.mjs",
+    "test:dedupe": "node tests/memory-dedupe.test.mjs",
+    "test:safety": "node tests/safety.test.mjs",
+    "test:persona": "node tests/persona-raw.test.mjs && node tests/persona-route.test.mjs",
+    "test:speech": "node tests/speech-join.test.mjs",
+    "test:safetydoc": "node tests/safety-doc.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
