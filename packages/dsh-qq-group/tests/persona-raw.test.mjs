@@ -12,8 +12,8 @@ import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
-const WORLD = new URL('../../dsh-world/lib/persona.js', import.meta.url);
-const mod = await import(WORLD.href);
+const WORLD = 'DSH_HOME/profiles/desktop/node_modules/dsh-world/lib/persona.js';
+const mod = await import('file://' + WORLD);
 const { readPersonaText, writePersonaText, readPersona, writePersona, renderPersona, PERSONA_LAYERS } = mod;
 
 // 临时目录用工作区自己的，宿主的 Temp 被 ACL 挡着
@@ -55,18 +55,13 @@ try {
   assert.equal(existsSync(file), false, '空白文本应删掉文件');
   assert.equal(readPersonaText(file), '', '删掉之后读成空串');
 
-  // ── 8. 大段角色卡：一字不丢 ──
-  // 默认用合成文本（260 行）；也可以用 DSH_WHALE_PERSONA 指向自己的角色卡跑真样本。
-  const samplePath = process.env.DSH_WHALE_PERSONA ?? '';
-  const real =
-    samplePath !== '' && existsSync(samplePath)
-      ? readFileSync(samplePath, 'utf8')
-      : Array.from({ length: 260 }, (_, i) => `第 ${i + 1} 行：这一行只是用来验证长文本往返不丢字。`).join(String.fromCharCode(10));
+  // ── 8. 真实角色卡：一字不丢 ──
+  const real = readFileSync('DSH_HOME/worlds/default/persona.md', 'utf8');
   writePersonaText(file, real);
   const round = readPersonaText(file);
-  assert.equal(round.trimEnd(), real.trimEnd(), '大段角色卡往返后不能少一个字');
-  assert.equal(round.split(String.fromCharCode(10)).length >= 200, true, '行数应该还是两百多行');
-  console.log('角色卡样本字符数:', real.length, '| 行数:', real.split(String.fromCharCode(10)).length);
+  assert.equal(round.trimEnd(), real.trimEnd(), '真实角色卡往返后不能少一个字');
+  assert.equal(round.split(String.fromCharCode(10)).length, real.split(String.fromCharCode(10)).length, '行数必须原样保留');
+  console.log('真实角色卡字符数:', real.length, '| 行数:', real.split('\n').length);
 
   // ── 9. 模拟「旧控制台把六层写空」：不再删掉角色卡，因为我们只走纯文本 ──
   writePersonaText(file, '');

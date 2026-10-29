@@ -172,6 +172,11 @@ export interface BridgeDeps {
   revealPrivateInGroup?: () => boolean;
   /** 记忆中心：日记/相册/流水写进家目录 */
   memoryHub?: MemoryHubHooks;
+  /**
+   * 「群聊同步私聊」带多少条。0 = 全部（不限制）。
+   * 以前这里写死 12，设置页那个值形同虚设。
+   */
+  sharedTranscriptTurns?: () => number;
   /** 日志 */
   log: (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void;
   /** 生成客户端；不传就用 config.llm 自建一个 OpenAI 兼容客户端 */
@@ -1128,6 +1133,20 @@ export class QqBridge {
       const worldText = [quoted, voiceNote, message.text]
         .filter((part) => part !== '')
         .join('\n');
+      /**
+       * 先记账，再交接。
+       *
+       * 2026-10-29 修：以前 worldSay 成功就直接 return，
+       * 而 appendMemoryTurn / recordTurn 写在这段后面，永远执行不到。
+       * 于是主人私聊在插件记忆里只有她自己的回复、没有主人说的话。
+       * 现在把「主人这句」先落进两个共用账本，再交给家会话：
+       *   - qq-memory（群聊那套读的就是它）
+       *   - 共用轮次（群聊提示词里的「最近说过的话」）
+       */
+      if (message.text.trim() !== '') {
+        this.appendMemoryTurn(sessionKey, { role: 'user', name, text: message.text.slice(0, 500), ts: now });
+        this.deps.memoryHub?.recordTurn({ role: 'user', content: message.text, session: sessionKey, name });
+      }
       if (
         this.deps.worldSay?.(worldText, {
           voice: asksForVoice(message.text),
@@ -3184,7 +3203,9 @@ export class QqBridge {
    */
   private sharedTranscriptNote(kind: 'group' | 'private', currentKey: string, revealOk = false): string {
     if (this.deps.sharedTranscript?.() !== true) return '';
-    const LIMIT = 12;
+    // 0 或负数 = 全部；上面再用一个宽松上限兜住手滑
+    const configured = this.deps.sharedTranscriptTurns?.() ?? 12;
+    const LIMIT = configured <= 0 ? 5000 : Math.min(5000, Math.max(1, configured));
     const lines: string[] = [];
     for (const [key, group] of Object.entries(this.memory.groups ?? {})) {
       if (key === currentKey) continue;

@@ -53,7 +53,7 @@
     "test:voice": "node tests/voice-trigger.test.mjs",
     "test:reply": "node tests/reply-plan.test.mjs",
     "test:private": "node tests/private.test.mjs",
-    "test": "npm run test:memory && npm run test:memory-center && npm run test:decision && npm run test:dedupe && npm run test:safety && npm run test:persona && npm run test:speech && npm run test:safetydoc && npm run test:proactive && npm run test:mood && npm run test:voice && npm run test:reply && npm run test:private",
+    "test": "npm run test:memory && npm run test:memory-center && npm run test:decision && npm run test:dedupe && npm run test:safety && npm run test:persona && npm run test:speech && npm run test:safetydoc && npm run test:tracepeople && npm run test:proactive && npm run test:mood && npm run test:voice && npm run test:reply && npm run test:private",
     "patches:verify": "node patches/verify.mjs",
     "patches:apply": "node patches/apply.mjs",
     "patches:check": "node patches/apply.mjs --check",
@@ -63,7 +63,8 @@
     "test:safety": "node tests/safety.test.mjs",
     "test:persona": "node tests/persona-raw.test.mjs && node tests/persona-route.test.mjs",
     "test:speech": "node tests/speech-join.test.mjs",
-    "test:safetydoc": "node tests/safety-doc.test.mjs"
+    "test:safetydoc": "node tests/safety-doc.test.mjs",
+    "test:tracepeople": "node tests/trace-people-time.test.mjs"
   },
   "engines": {
     "node": ">=22.12.0"

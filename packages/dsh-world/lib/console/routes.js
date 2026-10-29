@@ -97,6 +97,19 @@ async function write(actions, path, body) {
             actions.saveWorldPrompt(body.text);
             return ok();
         }
+        // 换家：把家切到指定会话
+        case '/console/home': {
+            const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+            if (sessionId === '')
+                return bad('sessionId must be a non-empty string');
+            try {
+                const id = await actions.switchHome(sessionId);
+                return ok({ homeSessionId: id });
+            }
+            catch (error) {
+                return bad(error instanceof Error ? error.message : String(error));
+            }
+        }
         default: return { status: 404, body: { error: 'not found' } };
     }
 }
@@ -122,6 +135,8 @@ export async function handleConsole(sources, actions, request) {
             return text === undefined ? { status: 404, body: { error: 'no diary for this date' } } : ok({ date, text });
         }
         case '/console/prompts': return ok(actions.prompts());
+        // 换家：列出房间工作区里可以当家的会话
+        case '/console/homes': return ok({ homes: await actions.homes() });
         default: return { status: 404, body: { error: 'not found' } };
     }
 }

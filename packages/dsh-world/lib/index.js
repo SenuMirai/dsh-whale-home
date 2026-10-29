@@ -39,6 +39,9 @@ export const Config = z.object({
     archiveScope: z.union([z.const('home').description('仅家会话'), z.const('workspace').description('家所在工作区'), z.transform(z.const('world').hidden(), () => 'workspace').hidden()]).default('workspace').description('记忆归档范围，修改后重启生效'),
     life: z.boolean().default(true), diaryDir: z.string(), fallbackWakeTime: z.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/).default('09:00'),
     selfFile: z.string(), worldPromptFile: z.string(), alarmTemplateFile: z.string(), personaFile: z.string(),
+    // 她的房间放在哪。默认是世界目录下的 room/；填别的目录可以让「家」挂在别的工作区上，
+    // 这样就能把已有的会话接过来当家（会话的 cwd 必须和这个目录一致）。
+    roomDir: z.string(),
     // Where her words go outside DSH; no app is known by name (see README for the push body).
     outlets: z.array(z.object({ name: z.string().required(), url: z.string(), urlFile: z.string(), path: z.string(), kinds: z.array(z.union([z.const('reply'), z.const('busy'), z.const('reach')])) })).default([]),
     // A local app may hand her partner's words to her home through POST /dsh-world/bridge/say.
@@ -72,7 +75,7 @@ export async function apply(ctx, config) {
     const selfFile = config.selfFile || join(worldDir, 'room', '我是谁.md');
     const personaFile = config.personaFile || join(worldDir, 'persona.md');
     const worldPromptFile = config.worldPromptFile || join(worldDir, 'world-prompt.md');
-    const options = { worldDir, roomDir: join(worldDir, 'room'), diaryDir: config.diaryDir || join(worldDir, 'diary'), selfFile, fallbackWakeTime: config.fallbackWakeTime, timeZone: config.timeZone, alarmFile: config.alarmTemplateFile || join(worldDir, 'alarm.md') };
+    const options = { worldDir, roomDir: config.roomDir || join(worldDir, 'room'), diaryDir: config.diaryDir || join(worldDir, 'diary'), selfFile, fallbackWakeTime: config.fallbackWakeTime, timeZone: config.timeZone, alarmFile: config.alarmTemplateFile || join(worldDir, 'alarm.md') };
     // 人设改成整段纯文本之后没有「名字」这一层了，名字只来自配置。
     const names = () => worldNames(config);
     const lifeStore = (() => {
@@ -303,6 +306,26 @@ export async function apply(ctx, config) {
             finally {
                 sources.invalidate();
             } return true; },
+            /** 房间工作区里能当家的会话清单（当前的排最前）。 */
+            homes: async () => {
+                if (!life)
+                    return [];
+                try {
+                    return await life.homeCandidates();
+                }
+                catch (error) {
+                    lifeCtx.logger.error(error);
+                    return [];
+                }
+            },
+            /** 把家换成另一个已有会话。 */
+            switchHome: async (sessionId) => {
+                if (!life)
+                    throw new Error('世界还没开始，先按「开始」');
+                const id = await life.switchHome(sessionId);
+                sources.invalidate();
+                return id;
+            },
             setWechatSettings: next => { power.setWechat(next); sources.invalidate(); },
             setArchiveScope: scope => { power.setArchiveScope(scope); sources.invalidate(); return power.restartRequired(); },
             saveWorldPrompt: text => { if (text.trim())

@@ -180,20 +180,26 @@
 ~/.dsh/profiles/<profile>/node_modules/dsh-world/        ← 世界控制台
 ```
 
-本仓库里两个包都在 `packages/` 下：
+本仓库里三个包都在 `packages/` 下：
 
 ```
 packages/
-├── dsh-qq-group/     QQ 群聊伴侣（含预构建 lib/）
-└── dsh-world/        世界控制台（含预构建 lib/ 与 client/）
+├── dsh-qq-group/       QQ 群聊伴侣（含预构建 lib/）
+├── dsh-world/          世界控制台（含预构建 lib/ 与 client/）
+└── dsh-jingjing-home/  第二套独立世界（同一个底座，路径与数据全隔离）
 ```
+
+**为什么有两个世界控制台？** 一个是主世界，一个是「鲸鲸小屋」。
+两份代码同源，但控制台路径（`/dsh-world` vs `/dsh-jingjing`）、桥路径、
+设置页 id、世界目录、人设、记忆、日记全部独立——可以给同一个 QQ 号的
+「群聊」和「私聊」配置两个不同的她，互不污染。
 
 `lib/` 是构建产物，仓库里已经带上了，装好即可运行，不需要自己编译。
 
 ### 启用
 
 在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 里加上两个插件条目，
-然后在 DSH 的设置里就能看到「QQ 群聊」和「世界控制台」两页。
+然后在 DSH 的设置里就能看到「QQ 群聊」「世界控制台」「鲸鲸小屋」三页。第二套世界是可选的，不用可以在配置里 `disabled: true`。
 
 ### 第一次跑
 
@@ -225,7 +231,7 @@ dsh-whale-home/
 │   │   │       ├── prompt.ts        提示词组装
 │   │   │       └── ...
 │   │   ├── lib/                预构建产物
-│   │   ├── tests/              16 组测试，全部可离线跑
+│   │   ├── tests/              20 组测试，全部可离线跑
 │   │   └── package.json
 │   └── dsh-world/
 │       ├── lib/                世界运行时（预构建）

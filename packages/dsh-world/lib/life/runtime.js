@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import "../hostContract.js";
@@ -370,6 +371,43 @@ export function createLifeRuntime(deps) {
         settled: async () => { while (delivery)
             await delivery; },
         home: () => home.open(),
+        /** 把家换成另一个已有会话（cwd 必须是这个世界的房间）。 */
+        switchHome: (sessionId) => home.moveIn(sessionId),
+        /** 房间工作区里可以当家的会话清单。 */
+        homeCandidates: async () => {
+            const workspace = await host.workspace(options.roomDir, roomTitle(names));
+            const ids = Array.from(workspace?.sessionIds ?? []);
+            /**
+             * 会话标题从宿主的投影缓存里读。
+             *
+             * 2026-10-29：以前用 agent.session.title，实际取不到，界面上只剩一串
+             * 十六进制 id，分不清哪个是她原来的家。投影缓存里 title 是准的。
+             */
+            const titleOf = (id) => {
+                try {
+                    const file = join(homedir(), '.dsh', 'storages', 'session_projcache', 'sessions', `${id}.json`);
+                    if (!existsSync(file))
+                        return '';
+                    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+                    const title = parsed?.record?.rows?.title?.val;
+                    return typeof title === 'string' ? title : '';
+                }
+                catch {
+                    return '';
+                }
+            };
+            const out = [];
+            for (const id of ids) {
+                let archived = false;
+                try {
+                    archived = host.isArchived(id);
+                }
+                catch { /* 忽略 */ }
+                out.push({ id, title: titleOf(id), archived, current: id === state.homeSessionId });
+            }
+            // 当前的排最前，其余按归档状态、名字排
+            return out.sort((a, b) => (a.current === b.current ? (a.archived === b.archived ? String(a.title).localeCompare(String(b.title), 'zh') : a.archived ? 1 : -1) : a.current ? -1 : 1));
+        },
         /** Whether this session is her home now; the world prompt gives the home its world line. */
         isHome: (sessionId) => !stopped && sessionId === state.homeSessionId,
     };

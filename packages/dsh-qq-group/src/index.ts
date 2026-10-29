@@ -36,6 +36,7 @@ import {
   rankTraces,
   recallForChat,
   recallTraces,
+  saveTraces,
   traceActivation,
   renderTraceBlock,
   syncTracePrompt,
@@ -85,6 +86,7 @@ import {
   selfieFile,
 } from './qq/selfies';
 import { DEFAULT_OWNER_PRIORITY } from './qq/prompt';
+import { listMemories as listMemoriesV3, readMemoryStore as readMemoryStoreV3 } from './qq/memory-v3';
 import { DEFAULT_SCORE_WEIGHTS, type ScoreRules, type ScoreWeights } from './qq/triggers';
 import { scanRvcModels } from './qq/rvc-models';
 import { createCommandRvcConverter } from './sound/rvc';
@@ -186,6 +188,12 @@ type Settings = {
   worldBridge: {
     enabled: boolean;
     worldId: string;
+    /**
+     * 主人私聊走哪个世界。留空 = 和 worldId 同一个。
+     * 填了之后群聊仍然用 worldId，只有「主人私聊」那一路切过去——
+     * 两个世界的人设、记忆、日记各过各的，互不污染。
+     */
+    privateWorldId: string;
     worldDir: string;
     privateBackend: 'world' | 'plugin' | 'chat';
     /** DSH 启动后主动叫醒她，不用等兜底闹钟 */
@@ -362,6 +370,7 @@ const DEFAULT_SETTINGS: Settings = {
   worldBridge: {
     enabled: false,
     worldId: 'default',
+    privateWorldId: '',
     worldDir: '',
     privateBackend: 'chat',
     wakeOnStart: false,
@@ -580,6 +589,8 @@ function readSettings(root: string): Settings {
             typeof source.worldId === 'string' && source.worldId.trim() !== ''
               ? source.worldId.trim().slice(0, 80)
               : 'default',
+          privateWorldId:
+            typeof source.privateWorldId === 'string' ? source.privateWorldId.trim().slice(0, 80) : '',
           worldDir: typeof source.worldDir === 'string' ? source.worldDir.trim().slice(0, 500) : '',
           privateBackend:
             source.privateBackend === 'world' || source.privateBackend === 'plugin'
@@ -740,7 +751,8 @@ function readSettings(root: string): Settings {
             : {};
         return {
           enabled: src.enabled === true,
-          turns: clampNumber(src.turns, 0, 40, DEFAULT_SETTINGS.sharedTranscript.turns),
+          // 0 = 全部；上限放到 5000，别再让 40 卡住
+          turns: clampNumber(src.turns, 0, 5000, DEFAULT_SETTINGS.sharedTranscript.turns),
           revealToGroup: src.revealToGroup === true,
         };
       })(),
@@ -1727,7 +1739,9 @@ ${recentPosts}`,
       if (dir === '') return '';
       const policy = readMemoryPolicy(dir);
       if (!policy.ok) return '';
-      const turns = readRecentTurns(dir, { limit: Math.max(4, Math.min(20, limit ?? policy.policy.contextTurns)), days: 2 });
+      // 以前硬顶 20 条，和「群聊同步私聊 12 条」一起把私聊记忆截得很短。
+      // 现在按设置走，最多 500 条；上限只防手滑填个天文数字。
+      const turns = readRecentTurns(dir, { limit: Math.max(4, Math.min(500, limit ?? policy.policy.contextTurns)), days: 7 });
       return turns
         .map((turn) => `${turn.role === 'assistant' ? '她' : '对方'}：${turn.content.replace(/\s+/gu, ' ').trim().slice(0, 200)}`)
         .join('\n');
@@ -1740,6 +1754,7 @@ ${recentPosts}`,
     ownerPriority: () => readSettings(root).ownerPriorityPrompt,
     // 群聊也读同一份记忆痕迹：和主人的记忆 + 群聊记忆
     sharedTranscript: () => readSettings(root).sharedTranscript.enabled === true,
+    sharedTranscriptTurns: () => readSettings(root).sharedTranscript.turns,
     revealPrivateInGroup: () => readSettings(root).sharedTranscript.revealToGroup === true,
     // 每条消息都会戳一次：15 秒内只认真一次，攒够了就立刻提炼。
     tracePoke: () => {
@@ -1773,7 +1788,7 @@ ${recentPosts}`,
     traceRecall: (query: string) =>
       recallForChat(traceStoreDir(), query, 6).map(
         (trace) =>
-          `${trace.domain === 'group' ? '群聊' : '和主人'}｜重要 ${trace.importance.toFixed(1)}｜想起 ${trace.recallCount} 次：${trace.text.replace(/\n/gu, ' / ').slice(0, 300)}`,
+          `${trace.domain === 'group' ? '群聊' : '和主人'}${trace.happenedAt ? `｜${new Date(trace.happenedAt).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : ''}${trace.people !== undefined && trace.people.length > 0 ? `｜${trace.people.slice(0, 3).join('、')}` : ''}｜重要 ${trace.importance.toFixed(1)}｜想起 ${trace.recallCount} 次：${trace.text.replace(/\n/gu, ' / ').slice(0, 300)}`,
       ),
     timeContext,
     generate: (system, history, user, options) => generate(system, history, user, options),
@@ -1912,7 +1927,17 @@ ${recentPosts}`,
   });
 
   worldRelay = new WorldRelay({
-    getInfo: () => readWorldBridge(root, readSettings(root).worldBridge),
+    // 私聊那一路可能走另一个世界（worldBridge.privateWorldId）。
+    // 留空就和群聊同一个世界，行为和以前完全一样。
+    getInfo: () => {
+      const bridge = readSettings(root).worldBridge;
+      const privateId = bridge.privateWorldId.trim();
+      if (privateId === '' || privateId === bridge.worldId.trim()) {
+        return readWorldBridge(root, bridge);
+      }
+      // 指定了私聊世界：按世界 ID 重新解析目录（worldDir 是给主世界留的手动覆盖）
+      return readWorldBridge(root, { enabled: bridge.enabled, worldId: privateId, worldDir: '' });
+    },
     deliver: async (text, kind, options) => {
       const owner = readQqConfig(qqConfigPath(root)).config.ownerQq.trim();
       if (owner === '') {
@@ -2040,7 +2065,80 @@ ${recentPosts}`,
         }
       })();
       const hint = fragmentHint(worldDir);
-      const merged = [block, digestTail, hint].filter((part) => part !== '').join('\n\n');
+      /**
+       * 共用记忆：永久记忆 + 记忆 v3。
+       *
+       * 以前这两份只有群聊读得到，世界私聊完全看不见——同一个她，两个脑子。
+       * 现在把它们也拼进世界提示词，做到「一份存储、两路读取」。
+       * 条数有上限，避免把世界提示词撑爆。
+       */
+      const sharedMemory = ((): string => {
+        const out: string[] = [];
+        try {
+          const ownerKey = `p:${readQqConfig(qqConfigPath(root)).config.ownerQq}`;
+          const perm = [
+            ...permanentList(root, ownerKey, 'global'),
+            ...permanentList(root, ownerKey, 'session'),
+          ];
+          if (perm.length > 0) {
+            out.push(
+              [
+                '【永久记忆（和 QQ 群聊读的同一份，主人指定要记住的）】',
+                ...perm.slice(-20).map((entry) => `- ${entry.text}`),
+              ].join('\n'),
+            );
+          }
+          const store = readMemoryStoreV3(join(root, 'memory-v3.json'));
+          const items = listMemoriesV3(store, ownerKey)
+            .slice()
+            .sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0))
+            .slice(0, 10);
+          if (items.length > 0) {
+            out.push(
+              [
+                '【长期记忆（按重要度取前 10 条，和群聊同一份）】',
+                ...items.map((item) => `- ${item.text}`),
+              ].join('\n'),
+            );
+          }
+        } catch {
+          /* 读不到就不注入，不影响主流程 */
+        }
+        return out.join('\n\n');
+      })();
+      /**
+       * 当天日记素材：插件那边记的「每条回复 + 评分理由 + 内心吐槽」。
+       *
+       * 这是给写日记用的原料，不是记忆本身。晚上她自己写日记时读一下，
+       * 把群里的原话、当时的吐槽提炼进当天的世界日记——日记只有世界这一本。
+       */
+      const diaryMaterial = ((): string => {
+        try {
+          const file = join(root, 'diary.json');
+          if (!existsSync(file)) return '';
+          const parsed = JSON.parse(readFileSync(file, 'utf8')) as { entries?: Array<Record<string, unknown>> };
+          const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+          const startOfDay = new Date();
+          startOfDay.setHours(0, 0, 0, 0);
+          const today = entries.filter((e) => typeof e.at === 'number' && e.at >= startOfDay.getTime());
+          if (today.length === 0) return '';
+          const lines = today.slice(-40).map((e) => {
+            const time = new Date(Number(e.at)).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+            const where = String(e.groupId ?? '').startsWith('p:') ? '私聊' : '群';
+            const reply = String(e.reply ?? e.text ?? '').replace(/\s+/gu, ' ').slice(0, 90);
+            const thought = String(e.thought ?? '').replace(/\s+/gu, ' ').slice(0, 60);
+            return `- ${time} ${where}｜我：${reply}${thought === '' ? '' : `｜当时想：${thought}`}`;
+          });
+          return [
+            '【今天值得写进日记的素材（QQ 那边记的，不是记忆）】',
+            ...lines,
+            '晚上写日记时可以翻一翻，提炼成自己的话；不要照抄。',
+          ].join('\n');
+        } catch {
+          return '';
+        }
+      })();
+      const merged = [block, digestTail, sharedMemory, diaryMaterial, hint].filter((part) => part !== '').join('\n\n');
       syncTracePrompt(join(worldDir, 'world-prompt.md'), merged);
     } catch {
       /* 记忆渲染失败不影响 QQ */
@@ -2376,7 +2474,7 @@ ${recentPosts}`,
         // 私聊（p:开头）归「和主人的记忆」，不进群聊提取，否则会把主人的话错标成群的。
         if (groupId.startsWith('p:')) continue;
         const turns = (group.turns ?? []).filter(
-          (turn): turn is { role: string; text: string; ts: number } =>
+          (turn): turn is { role: string; text: string; ts: number; name?: string } =>
             typeof turn.ts === 'number' &&
             typeof turn.text === 'string' &&
             turn.text.trim() !== '' &&
@@ -2388,8 +2486,9 @@ ${recentPosts}`,
 
         const system = [
           '你在帮大肥鱼整理「群聊记忆」。只输出 JSON 数组，不要解释。',
-          '每条：{"text":"发生了什么（一句事实）","feeling":"当时她心里怎么想、什么感觉（一句话，简练）","importance":0~1,"emotion":0~1}',
+          '每条：{"text":"发生了什么（一句事实，必须写清是谁说的/做的）","people":["相关的人名，用对话里出现的原名"],"feeling":"当时她心里怎么想、什么感觉（一句话，简练）","importance":0~1,"emotion":0~1}',
           'feeling 用第一人称，像她自己在心里嘀咕一句；不要客套话、不要复述 text。',
+          'text 里不要用「群友」「有人」「对方」这种泛指——写具体昵称；确实不知道是谁才用泛指。',
           '只记群友之间真实发生的事：谁在意什么、群里的梗、关系变化、她自己说过的话。',
           '不要记录刷屏、复读、纯表情、机器人操作；不要编造。没有值得记的就输出 []。最多 5 条。',
         ].join('\n');
@@ -2401,7 +2500,9 @@ ${recentPosts}`,
         for (let batch = 0; batch < 6 && offset < pending.length; batch += 1) {
           const slice = pending.slice(offset, offset + 30);
           if (slice.length === 0) break;
-          const lines = slice.map((turn) => `${turn.role === 'user' ? '群友' : '大肥鱼'}：${turn.text.slice(0, 200)}`);
+          // 以前这里把发言人抹成「群友」，模型当然只能写出「群友说…」。
+          // 改成带真实昵称；名字缺失才退回「群友」。
+          const lines = slice.map((turn) => `${turn.role === 'user' ? (turn.name?.trim() || '群友') : '大肥鱼'}：${turn.text.slice(0, 200)}`);
           const result = await generate(system, [], `这个群最近的对话：\n${lines.join('\n')}\n\n请提取。`, {
             json: true,
             maxTokens: 900,
@@ -2425,6 +2526,11 @@ ${recentPosts}`,
               makeTrace({
                 text: item.text,
                 ...(typeof item.feeling === 'string' ? { feeling: item.feeling } : {}),
+                ...(Array.isArray(item.people)
+                  ? { people: item.people.filter((p): p is string => typeof p === 'string') }
+                  : {}),
+                // 时间取这批消息里最后一条的真实发送时刻，不是落盘时刻
+                happenedAt: slice[slice.length - 1]?.ts,
                 domain: 'group',
                 importance: typeof item.importance === 'number' ? Math.min(0.75, item.importance) : undefined,
                 emotion: typeof item.emotion === 'number' ? item.emotion : undefined,
@@ -2735,6 +2841,36 @@ ${recentPosts}`,
         return send(200, { ok: true, pending, draft, result });
       }
 
+      // 有哪些世界可以选（给「私聊世界」下拉用）。
+      // 只列 DSH_HOME/worlds/ 下真实存在的目录，顺带说明它的桥在不在线。
+      if (rest === 'world/list' && method === 'GET') {
+        const base = join(dirname(root), 'worlds');
+        const items: Array<{ id: string; online: boolean; note: string }> = [];
+        try {
+          for (const entry of readdirSync(base, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            let online = false;
+            let note = '';
+            try {
+              const bridgeFile = join(base, entry.name, 'bridge.json');
+              if (existsSync(bridgeFile)) {
+                const parsed = JSON.parse(readFileSync(bridgeFile, 'utf8')) as { origin?: unknown; pid?: unknown };
+                online = typeof parsed.origin === 'string' && parsed.origin !== '';
+              } else {
+                note = '这个世界的桥还没启动';
+              }
+            } catch {
+              note = '桥信息读不到';
+            }
+            items.push({ id: entry.name, online, note });
+          }
+        } catch {
+          /* 没有 worlds 目录就返回空表 */
+        }
+        items.sort((a, b) => a.id.localeCompare(b.id));
+        return send(200, { ok: true, worlds: items });
+      }
+
       if (rest === 'world/model' && method === 'GET') {
         const settings = readSettings(root);
         const worldDir = readWorldBridge(root, settings.worldBridge).worldDir;
@@ -2843,6 +2979,28 @@ ${recentPosts}`,
 
       if (rest === 'world/traces' && method === 'GET') {
         return send(200, { ok: true, traces: rankedTraces() });
+      }
+
+      /**
+       * 批量回填 happenedAt（一次性修数据用）。
+       *
+       * 老痕迹只有 createdAt（写入时刻），注入提示词时没带时间，
+       * 她回忆起来就是一堆「无时间的孤立事实」。这里把 createdAt 复制过去。
+       */
+      if (rest === 'world/traces-catchup' && method === 'POST') {
+        const dir = traceStoreDir();
+        if (dir === '') return send(200, { ok: false, message: '世界桥没开或没配目录' });
+        const all = loadTraces(dir);
+        let filled = 0;
+        const next = all.map((trace) => {
+          if (typeof trace.happenedAt === 'number' && trace.happenedAt > 0) return trace;
+          if (typeof trace.createdAt !== 'number' || trace.createdAt <= 0) return trace;
+          filled += 1;
+          return { ...trace, happenedAt: trace.createdAt };
+        });
+        saveTraces(dir, next);
+        syncTraceBlock();
+        return send(200, { ok: true, total: next.length, filled });
       }
 
       if (rest === 'world/traces' && method === 'POST') {
@@ -3678,7 +3836,7 @@ ${recentPosts}`,
                   : current.sharedTranscript.enabled,
               turns:
                 typeof sharedIncoming.turns === 'number'
-                  ? Math.round(clampNumber(sharedIncoming.turns, 0, 40, current.sharedTranscript.turns))
+                  ? Math.round(clampNumber(sharedIncoming.turns, 0, 5000, current.sharedTranscript.turns))
                   : current.sharedTranscript.turns,
               revealToGroup:
                 typeof sharedIncoming.revealToGroup === 'boolean'
@@ -3884,6 +4042,10 @@ ${recentPosts}`,
                   typeof incoming.worldId === 'string' && incoming.worldId.trim() !== ''
                     ? incoming.worldId.trim().slice(0, 80)
                     : current.worldBridge.worldId,
+                privateWorldId:
+                  typeof incoming.privateWorldId === 'string'
+                    ? incoming.privateWorldId.trim().slice(0, 80)
+                    : current.worldBridge.privateWorldId,
                 worldDir:
                   typeof incoming.worldDir === 'string'
                     ? incoming.worldDir.trim().slice(0, 500)

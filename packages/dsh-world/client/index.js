@@ -616,7 +616,7 @@ function activityNote(r) {
             ['会话', String(life.homeSessionId || '还没有家').replace(/^session-/, '').slice(0, 8)],
             ['下次回顾', life.review ? local(life.review.at, zone) : '—'],
             ['最近', wakes.length ? h('div', { className: 'dw-trail' }, wakes.map(function (w, i) { return h('span', { key: i }, local(w.deliveredAt, zone) + ' ' + (sourceLabel[w.source] || w.source) + (w.lateMs >= 120000 ? ' · 晚 ' + Math.round(w.lateMs / 60000) + ' 分' : '')) })) : '—'],
-          ]))) : null,
+          ]), h(HomeSwitch, { current: life.homeSessionId, onSaved: props.refresh }))) : null,
         h('div', { className: 'dw-grid' },
           h(Card, { title: '健康', delay: 120 }, health.length ? health.map(function (f, i) { return h('div', { key: i, className: 'dw-bad' }, '● ' + f) }) : h('div', { className: 'dw-ok' }, '● 一切正常')),
           h(Memory, { mem: mem, onSaved: props.refresh }),
@@ -685,6 +685,48 @@ function activityNote(r) {
           advice.map(function (a, i) { return h('div', { key: i, className: 'dw-muted' }, '· ' + a) })) : null)
     }
 
+    /** 换家：把她的家切到房间工作区里的另一个会话。 */
+    function HomeSwitch(props) {
+      var state = useState(null); var homes = state[0]; var setHomes = state[1]
+      var msgState = useState(''); var msg = msgState[0]; var setMsg = msgState[1]
+      var busyState = useState(false); var busy = busyState[0]; var setBusy = busyState[1]
+      function load() {
+        fetch('/dsh-world/console/homes', { cache: 'no-store' })
+          .then(function (r) { return r.json() })
+          .then(function (v) { setHomes(list(v && v.homes)) }, function () { setHomes([]) })
+      }
+      useEffect(load, [])
+      function pick(id) {
+        if (!id || busy) return
+        setBusy(true); setMsg('切换中…')
+        fetch('/dsh-world/console/home', { method: 'POST', headers: { 'content-type': 'application/json', 'x-dsh-world': '1' }, body: JSON.stringify({ sessionId: id }) })
+          .then(function (r) { return r.json().then(function (v) { return { ok: r.ok, v: v } }) })
+          .then(function (res) {
+            if (!res.ok || res.v.ok === false) { setMsg('切换失败：' + ((res.v && res.v.error) || '未知原因')); return }
+            setMsg('已换到 ' + String(id).replace(/^session-/, '').slice(0, 8) + '，她会先打个招呼。')
+            if (props.onSaved) props.onSaved()
+            load()
+          }, function (e) { setMsg('切换失败：' + (e.message || e)) })
+          .then(function () { setBusy(false) })
+      }
+      var current = props.current || ''
+      return h('div', { style: { marginTop: 12, paddingTop: 10, borderTop: '1px dashed var(--line)' } },
+        h('div', { className: 'dw-muted', style: { marginBottom: 6, fontSize: 12 } }, '换家：先在侧边栏那个房间工作区里新建一个会话并点开它一次，再回来选它。'),
+        homes === null
+          ? h('div', { className: 'dw-muted' }, '读取中…')
+          : homes.length === 0
+            ? h('div', { className: 'dw-muted' }, '这个房间里还没有别的会话。')
+            : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                homes.map(function (item) {
+                  var label = (item.title || String(item.id).replace(/^session-/, '').slice(0, 8)) + (item.archived ? '（已归档，不能当家用）' : '')
+                  var isCur = item.current || item.id === current
+                  return h('label', { key: item.id, style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, opacity: item.archived ? 0.5 : 1 } },
+                    h('input', { type: 'radio', name: 'dw-home', checked: isCur, disabled: busy || item.archived, onChange: function () { pick(item.id) } }),
+                    h('span', null, label),
+                    isCur ? h('span', { className: 'dw-muted' }, '· 现在是她家') : null)
+                })),
+        msg ? h('div', { className: 'dw-muted', style: { marginTop: 6, fontSize: 12 } }, msg) : null)
+    }
     function Digest(props) {
       var state = useState(null), data = state[0], setData = state[1]
       var groupState = useState('all'), group = groupState[0], setGroup = groupState[1]

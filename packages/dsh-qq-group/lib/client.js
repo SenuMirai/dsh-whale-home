@@ -365,6 +365,7 @@ window.__ModuleLoader__.load({
       const [worldModelMsg, setWorldModelMsg] = React.useState('');
       const [worldQzone, setWorldQzone] = React.useState(null);
       const [worldDigest, setWorldDigest] = React.useState(null);
+      const [worldList, setWorldList] = React.useState([]);
       const [worldDeliveries, setWorldDeliveries] = React.useState([]);
       const [worldMemory, setWorldMemory] = React.useState(null);
       const [worldTraces, setWorldTraces] = React.useState([]);
@@ -448,6 +449,10 @@ window.__ModuleLoader__.load({
           setWorldModel(await (await fetch(BASE + '/world/model', { cache: 'no-store' })).json());
           setWorldQzone(await (await fetch(BASE + '/world/qzone', { cache: 'no-store' })).json());
           setWorldDigest(await (await fetch(BASE + '/world/digest', { cache: 'no-store' })).json());
+          try {
+            const wl = await (await fetch(BASE + '/world/list', { cache: 'no-store' })).json();
+            setWorldList(Array.isArray(wl.worlds) ? wl.worlds : []);
+          } catch { /* 忽略 */ }
           const deliv = await (await fetch(BASE + '/world/deliveries', { cache: 'no-store' })).json();
           setWorldDeliveries(Array.isArray(deliv.entries) ? deliv.entries.slice().reverse() : []);
         } catch {
@@ -2002,6 +2007,19 @@ window.__ModuleLoader__.load({
             h(Row, { label: '世界 ID' },
               h('input', { style: s.input, value: (settings.worldBridge && settings.worldBridge.worldId) || 'default', onChange: function (e) { setSettings({ ...settings, worldBridge: { ...(settings.worldBridge || {}), worldId: e.target.value } }); } }),
               h('span', { style: s.note, children: worldData && worldData.worldDir ? worldData.worldDir : '默认 <DSH_HOME>/worlds/<id>' }),
+            ),
+            h(Row, { label: '私聊世界' },
+              h('select', {
+                style: s.input,
+                value: (settings.worldBridge && settings.worldBridge.privateWorldId) || '',
+                onChange: function (e) { setSettings({ ...settings, worldBridge: { ...(settings.worldBridge || {}), privateWorldId: e.target.value } }); },
+              },
+                h('option', { value: '', children: '和群聊同一个世界' }),
+                (Array.isArray(worldList) ? worldList : []).map(function (item) {
+                  return h('option', { key: item.id, value: item.id, children: item.id + (item.online ? '' : '（桥未启动）') });
+                }),
+              ),
+              h('span', { style: s.note, children: '群聊仍用上面那个世界；这里选的只影响「主人私聊」。两个世界的人设、记忆、日记各过各的。' }),
             ),
             h(Row, { label: '世界模型' },
               h('select', { style: s.input, value: (worldModel && worldModel.current && worldModel.current.provider) || '', onChange: function (e) {

@@ -80,6 +80,31 @@ export function createHome(deps) {
     return {
         /** The current home, resolving or rebuilding it; one attempt at a time. */
         open() { return opening ??= build().finally(() => { opening = undefined; }); },
+        /**
+         * 把家换成一个已经存在的会话。
+         *
+         * 2026-10-29 加：以前只会在「没有家」时新建，没法换成别的会话。
+         * 这里先做三重校验，任何一种不满足就明确报错，不要留下半挂的状态：
+         *   1. 生活线没停
+         *   2. 那个会话没归档
+         *   3. 那个会话的 cwd 必须是这个世界的房间目录（attachSession 会拦）
+         */
+        async moveIn(sessionId) {
+            if (deps.stopped())
+                throw new Error('生活线已停止，先按「开始」再切换');
+            if (host.isArchived(sessionId))
+                throw new Error('这个会话已归档，不能当作她的家');
+            const agent = await host.resolveAgent(sessionId);
+            if (!agent)
+                throw new Error('这个会话还没被载入，先在侧边栏点开它一次');
+            const workspace = await room();
+            if (workspace && !workspace.sessionIds.includes(agent.id)) {
+                // cwd 对不上时这里会抛，正是不该允许的情况
+                await workspace.attachSession(agent.id);
+            }
+            deps.moveIn(sessionId);
+            return agent.id;
+        },
         turnEnded(sessionId) {
             if (firstTurn !== sessionId || deps.stopped())
                 return;

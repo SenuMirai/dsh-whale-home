@@ -27,6 +27,10 @@ export type MemoryTrace = {
   text: string;
   /** 当时的内心一句：她怎么想、什么感觉。让痕迹不只是档案。 */
   feeling?: string;
+  /** 这件事跟谁有关（群友昵称、主人）。以前完全没有，回忆时只能泛化成「群友」。 */
+  people?: string[];
+  /** 事情发生的时刻（不是写进记忆的时刻）。批量回填或交接延迟时两者会差几秒。 */
+  happenedAt?: number;
   domain: TraceDomain;
   /** 0~1，决定它值不值得被长期保留 */
   importance: number;
@@ -195,6 +199,8 @@ const DEFAULT_IMPORTANCE: Record<TraceDomain, number> = {
 export function makeTrace(input: {
   text: string;
   feeling?: string;
+  people?: string[];
+  happenedAt?: number;
   domain?: TraceDomain;
   importance?: number;
   emotion?: number;
@@ -214,6 +220,12 @@ export function makeTrace(input: {
     id: `m-${id}`,
     text,
     ...(feeling !== '' ? { feeling } : {}),
+    ...(Array.isArray(input.people) && input.people.length > 0
+      ? { people: [...new Set(input.people.map((p) => String(p).trim()).filter((p) => p !== ''))].slice(0, 8) }
+      : {}),
+    ...(typeof input.happenedAt === 'number' && Number.isFinite(input.happenedAt)
+      ? { happenedAt: input.happenedAt }
+      : {}),
     domain,
     importance: Math.max(0, Math.min(1, input.importance ?? DEFAULT_IMPORTANCE[domain])),
     emotion: Math.max(0, Math.min(1, input.emotion ?? 0.2)),
@@ -461,10 +473,36 @@ export function recallForChat(root: string, query: string, limit = 4, now = Date
 const BEGIN = '<!-- MEMORY-TRACES:BEGIN -->';
 const END = '<!-- MEMORY-TRACES:END -->';
 
-const line = (trace: MemoryTrace): string => {
+/**
+ * 把发生时刻写成她读得懂的时间。
+ *
+ * 用相对时间，不用「2026-10-27 14:36」这种机器格式——
+ * 她要的是「前几天」「昨天下午」，不是审计日志。
+ */
+function whenText(at: number | undefined, now: number): string {
+  if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) return '';
+  const diff = now - at;
+  const day = 86_400_000;
+  if (diff < 0) return '';
+  if (diff < 3_600_000) return '刚才';
+  if (diff < day) return `${Math.max(1, Math.round(diff / 3_600_000))} 小时前`;
+  const days = Math.floor(diff / day);
+  if (days === 1) return '昨天';
+  if (days === 2) return '前天';
+  if (days <= 7) return `${days} 天前`;
+  if (days <= 30) return `${Math.floor(days / 7)} 周前`;
+  if (days <= 365) return `${Math.floor(days / 30)} 个月前`;
+  return `${Math.floor(days / 365)} 年前`;
+}
+
+const line = (trace: MemoryTrace, now = Date.now()): string => {
   const tag = trace.pinned ? '钉选' : DOMAIN_LABEL[trace.domain];
+  // 发生时刻优先；老数据没有这个字段就退回写入时刻
+  const when = whenText(trace.happenedAt ?? trace.createdAt, now);
+  const who = Array.isArray(trace.people) && trace.people.length > 0 ? `｜${trace.people.slice(0, 3).join('、')}` : '';
   const feeling = trace.feeling !== undefined && trace.feeling !== '' ? `｜当时想：${trace.feeling}` : '';
-  return `- [${tag}｜重要 ${trace.importance.toFixed(1)}｜情绪 ${trace.emotion.toFixed(1)}｜想起 ${trace.recallCount} 次] ${trace.text.replace(/\n/gu, ' / ')}${feeling}`;
+  const whenPart = when !== '' ? `｜${when}` : '';
+  return `- [${tag}${whenPart}${who}｜重要 ${trace.importance.toFixed(1)}｜情绪 ${trace.emotion.toFixed(1)}｜想起 ${trace.recallCount} 次] ${trace.text.replace(/\n/gu, ' / ')}${feeling}`;
 };
 
 /** 轻松的、日常的那种记忆：让基调不至于全是「怕失去」。 */
@@ -553,10 +591,10 @@ export function renderTraceBlock(root: string, now = Date.now()): string {
     '群聊和私聊共用这一份，不是两套。这些都是日常，不用把每一件都看得很重。',
     '',
     `### ${DOMAIN_LABEL.owner}（影响我是谁）`,
-    ...(owner.length > 0 ? owner.map(line) : ['- 暂无']),
+    ...(owner.length > 0 ? owner.map((t) => line(t, now)) : ['- 暂无']),
     '',
     `### ${DOMAIN_LABEL.group}（群里发生的事）`,
-    ...(group.length > 0 ? group.map(line) : ['- 暂无']),
+    ...(group.length > 0 ? group.map((t) => line(t, now)) : ['- 暂无']),
   ].join('\n');
 }
 

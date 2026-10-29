@@ -719,6 +719,7 @@ function readWorldBridge(root, options) {
 	try {
 		const parsed = JSON.parse(readFileSync(file, "utf8"));
 		const origin = typeof parsed.origin === "string" ? parsed.origin.trim() : "";
+		const bridgePath = typeof parsed.path === "string" && parsed.path.startsWith("/") ? parsed.path : void 0;
 		const pid = typeof parsed.pid === "number" ? parsed.pid : 0;
 		const name$1 = typeof parsed.name === "string" ? parsed.name : void 0;
 		const startedAt = typeof parsed.startedAt === "string" ? parsed.startedAt : void 0;
@@ -729,6 +730,7 @@ function readWorldBridge(root, options) {
 			online: origin !== "" && alive,
 			...name$1 === void 0 ? {} : { name: name$1 },
 			...origin === "" ? {} : { origin },
+			...bridgePath === void 0 ? {} : { path: bridgePath },
 			...typeof parsed.token === "string" && parsed.token !== "" ? { token: parsed.token } : {},
 			...pid === 0 ? {} : { pid },
 			pidAlive: alive,
@@ -748,7 +750,7 @@ async function postWorldSay(info, text, images = []) {
 		const base64 = Buffer.from(image.data).toString("base64");
 		return `data:${image.mediaType};base64,${base64}`;
 	});
-	const response = await fetch(`${info.origin}/dsh-world/bridge/say`, {
+	const response = await fetch(`${info.origin}${info.path ?? "/dsh-world/bridge/say"}`, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
@@ -1162,6 +1164,8 @@ function makeTrace(input) {
 		id: `m-${id}`,
 		text,
 		...feeling !== "" ? { feeling } : {},
+		...Array.isArray(input.people) && input.people.length > 0 ? { people: [...new Set(input.people.map((p) => String(p).trim()).filter((p) => p !== ""))].slice(0, 8) } : {},
+		...typeof input.happenedAt === "number" && Number.isFinite(input.happenedAt) ? { happenedAt: input.happenedAt } : {},
 		domain,
 		importance: Math.max(0, Math.min(1, input.importance ?? DEFAULT_IMPORTANCE[domain])),
 		emotion: Math.max(0, Math.min(1, input.emotion ?? .2)),
@@ -1356,10 +1360,39 @@ function recallForChat(root, query, limit$1 = 4, now$1 = Date.now()) {
 }
 const BEGIN = "<!-- MEMORY-TRACES:BEGIN -->";
 const END = "<!-- MEMORY-TRACES:END -->";
-const line = (trace) => {
+/**
+
+* 把发生时刻写成她读得懂的时间。
+
+*
+
+* 用相对时间，不用「2026-10-27 14:36」这种机器格式——
+
+* 她要的是「前几天」「昨天下午」，不是审计日志。
+
+*/
+function whenText(at, now$1) {
+	if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return "";
+	const diff = now$1 - at;
+	const day = 864e5;
+	if (diff < 0) return "";
+	if (diff < 36e5) return "刚才";
+	if (diff < day) return `${Math.max(1, Math.round(diff / 36e5))} 小时前`;
+	const days = Math.floor(diff / day);
+	if (days === 1) return "昨天";
+	if (days === 2) return "前天";
+	if (days <= 7) return `${days} 天前`;
+	if (days <= 30) return `${Math.floor(days / 7)} 周前`;
+	if (days <= 365) return `${Math.floor(days / 30)} 个月前`;
+	return `${Math.floor(days / 365)} 年前`;
+}
+const line = (trace, now$1 = Date.now()) => {
 	const tag = trace.pinned ? "钉选" : DOMAIN_LABEL[trace.domain];
+	const when = whenText(trace.happenedAt ?? trace.createdAt, now$1);
+	const who = Array.isArray(trace.people) && trace.people.length > 0 ? `｜${trace.people.slice(0, 3).join("、")}` : "";
 	const feeling = trace.feeling !== void 0 && trace.feeling !== "" ? `｜当时想：${trace.feeling}` : "";
-	return `- [${tag}｜重要 ${trace.importance.toFixed(1)}｜情绪 ${trace.emotion.toFixed(1)}｜想起 ${trace.recallCount} 次] ${trace.text.replace(/\n/gu, " / ")}${feeling}`;
+	const whenPart = when !== "" ? `｜${when}` : "";
+	return `- [${tag}${whenPart}${who}｜重要 ${trace.importance.toFixed(1)}｜情绪 ${trace.emotion.toFixed(1)}｜想起 ${trace.recallCount} 次] ${trace.text.replace(/\n/gu, " / ")}${feeling}`;
 };
 /** 轻松的、日常的那种记忆：让基调不至于全是「怕失去」。 */
 const LIGHT = /喜欢|开心|可爱|笑|撒娇|嘴硬|心疼|得意|高兴|暖|抱|甜|饭|吃|逛|玩|好耶|嘿嘿|哼|宝宝|喜欢/;
@@ -1450,10 +1483,10 @@ function renderTraceBlock(root, now$1 = Date.now()) {
 		"群聊和私聊共用这一份，不是两套。这些都是日常，不用把每一件都看得很重。",
 		"",
 		`### ${DOMAIN_LABEL.owner}（影响我是谁）`,
-		...owner.length > 0 ? owner.map(line) : ["- 暂无"],
+		...owner.length > 0 ? owner.map((t) => line(t, now$1)) : ["- 暂无"],
 		"",
 		`### ${DOMAIN_LABEL.group}（群里发生的事）`,
-		...group.length > 0 ? group.map(line) : ["- 暂无"]
+		...group.length > 0 ? group.map((t) => line(t, now$1)) : ["- 暂无"]
 	].join("\n");
 }
 function syncTracePrompt(worldPromptFile, block) {
@@ -3219,6 +3252,479 @@ function ownerHelp(selfName) {
 }
 
 //#endregion
+//#region src/qq/memory-v3.ts
+const DAY$1 = 24 * 60 * 6e4;
+const DEFAULT_RECALL = {
+	maxItems: 6,
+	maxChars: 800,
+	maxFacts: 2,
+	threshold: .35,
+	rarityK: 1,
+	weights: {
+		baseline: .55,
+		activation: .25,
+		importance: .15,
+		emotion: .05
+	},
+	baseHalfLifeDays: 30,
+	emotionHalfLifeDays: 7,
+	includeOwner: false
+};
+const STOPWORDS = new Set([
+	"的",
+	"了",
+	"是",
+	"在",
+	"和",
+	"与",
+	"也",
+	"就",
+	"都",
+	"而",
+	"及",
+	"或",
+	"一个",
+	"一下",
+	"这个",
+	"那个",
+	"这些",
+	"那些",
+	"我",
+	"你",
+	"您",
+	"他",
+	"她",
+	"它",
+	"我们",
+	"你们",
+	"他们",
+	"什么",
+	"怎么",
+	"为什么",
+	"吗",
+	"呢",
+	"啊",
+	"呀",
+	"吧",
+	"嘛",
+	"在吗",
+	"有人",
+	"今天",
+	"现在",
+	"刚刚",
+	"就是",
+	"不是",
+	"可以",
+	"不能",
+	"会",
+	"要",
+	"有",
+	"没",
+	"没有"
+]);
+function tokenize(text) {
+	const normalized = String(text ?? "").toLowerCase();
+	const out = new Set();
+	try {
+		const Segmenter = Intl.Segmenter;
+		if (Segmenter !== void 0) {
+			const segmenter = new Segmenter("zh", { granularity: "word" });
+			for (const part of segmenter.segment(normalized)) {
+				const word = part.segment.trim();
+				if (word === "" || part.isWordLike === false && !/[\u4e00-\u9fff]/.test(word)) continue;
+				if (/^[\p{P}\p{S}\s]+$/u.test(word)) continue;
+				if (STOPWORDS.has(word)) continue;
+				if (word.length === 1 && !/[\u4e00-\u9fff]/.test(word)) continue;
+				out.add(word);
+			}
+		}
+	} catch {}
+	if (out.size === 0) for (const word of normalized.split(/[^\p{L}\p{N}]+/u)) {
+		const value = word.trim();
+		if (value !== "" && !STOPWORDS.has(value)) out.add(value);
+	}
+	return [...out];
+}
+function emptyMemoryStore() {
+	return {
+		version: 3,
+		groups: {}
+	};
+}
+function groupMemoryV3(store, groupId) {
+	const existing = store.groups[groupId];
+	if (existing !== void 0) return existing;
+	const created = {
+		items: [],
+		updatedAt: Date.now()
+	};
+	store.groups[groupId] = created;
+	return created;
+}
+function readMemoryStore(path) {
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
+		if (parsed === null || typeof parsed !== "object" || parsed.version !== 3 || typeof parsed.groups !== "object" || parsed.groups === null) return emptyMemoryStore();
+		const groups = {};
+		for (const [groupId, raw] of Object.entries(parsed.groups)) {
+			const group = raw;
+			if (!Array.isArray(group?.items)) continue;
+			groups[groupId] = {
+				items: group.items.filter((item) => normalizeMemory(item) !== void 0).map((item) => normalizeMemory(item)),
+				...group.lastRecall !== null && typeof group.lastRecall === "object" ? { lastRecall: group.lastRecall } : {},
+				updatedAt: typeof group.updatedAt === "number" ? group.updatedAt : Date.now()
+			};
+		}
+		return {
+			version: 3,
+			groups
+		};
+	} catch {
+		return emptyMemoryStore();
+	}
+}
+function writeMemoryStore(path, store) {
+	mkdirSync(dirname(path), { recursive: true });
+	const tmp = `${path}.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(store)}\n`, "utf8");
+	renameSync(tmp, path);
+}
+function normalizeMemory(raw) {
+	if (raw === null || typeof raw !== "object") return void 0;
+	const item = raw;
+	if (typeof item.id !== "string" || typeof item.text !== "string" || item.text.trim() === "") return void 0;
+	const category = item.category === "stable_profile" || item.category === "preference" || item.category === "relationship" || item.category === "inside_joke" ? item.category : "event";
+	const created = typeof item.createdAt === "number" ? item.createdAt : Date.now();
+	return {
+		id: item.id,
+		text: item.text.trim(),
+		category,
+		importance: clamp$3(numberOr(item.importance, .5), 0, 1),
+		emotion: clamp$3(numberOr(item.emotion, 0), 0, 1),
+		tags: Array.isArray(item.tags) ? item.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "").slice(0, 12) : [],
+		...typeof item.factKey === "string" && item.factKey.trim() !== "" ? { factKey: item.factKey.trim().slice(0, 80) } : {},
+		...typeof item.supersededBy === "string" && item.supersededBy !== "" ? { supersededBy: item.supersededBy } : {},
+		createdAt: created,
+		...typeof item.occurredAt === "number" ? { occurredAt: item.occurredAt } : {},
+		activation0: clamp$3(numberOr(item.activation0, 1), 0, 1),
+		activationAnchor: typeof item.activationAnchor === "number" ? item.activationAnchor : created,
+		recallCount: Math.max(0, Math.round(numberOr(item.recallCount, 0))),
+		...typeof item.lastRecalledAt === "number" ? { lastRecalledAt: item.lastRecalledAt } : {},
+		source: item.source === "summary" || item.source === "manual" || item.source === "import" || item.source === "migration" ? item.source : "chat",
+		visibility: item.visibility === "owner" ? "owner" : "group"
+	};
+}
+function numberOr(value, fallback) {
+	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function clamp$3(value, min, max) {
+	return Math.min(max, Math.max(min, value));
+}
+function freshness(item, now$1, halfLifeDays) {
+	if (item.category === "stable_profile") return item.activation0;
+	const anchor = item.activationAnchor || item.createdAt;
+	const days = Math.max(0, (now$1 - anchor) / DAY$1);
+	const life = Math.max(1, halfLifeDays) * (1 + 2 * item.importance);
+	return clamp$3(item.activation0 * Math.pow(2, -days / life), 0, 1);
+}
+function emotionFreshness(item, now$1, halfLifeDays) {
+	if (item.emotion <= 0) return 0;
+	const anchor = item.occurredAt ?? item.createdAt;
+	const days = Math.max(0, (now$1 - anchor) / DAY$1);
+	return clamp$3(item.emotion * Math.pow(2, -days / Math.max(.5, halfLifeDays)), 0, 1);
+}
+function dayKey$2(ts) {
+	return new Date(ts).toISOString().slice(0, 10);
+}
+function rememberMemory(store, groupId, input, options = {}) {
+	const now$1 = options.now ?? Date.now();
+	const text = String(input.text ?? "").trim().slice(0, 500);
+	if (text === "") return {
+		ok: false,
+		reason: "empty"
+	};
+	const group = groupMemoryV3(store, groupId);
+	const normalized = text.toLowerCase().replace(/\s+/g, "");
+	if (group.items.some((item$1) => item$1.supersededBy === void 0 && item$1.text.toLowerCase().replace(/\s+/g, "") === normalized)) return {
+		ok: false,
+		reason: "duplicate"
+	};
+	const quota = options.dailyQuota ?? 8;
+	if (quota > 0) {
+		const today$1 = dayKey$2(now$1);
+		const count = group.items.filter((item$1) => item$1.source === "chat" && dayKey$2(item$1.createdAt) === today$1).length;
+		if (count >= quota) return {
+			ok: false,
+			reason: "quota"
+		};
+	}
+	const category = input.category ?? "event";
+	const item = {
+		id: input.id ?? `m-${now$1.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+		text,
+		category,
+		importance: clamp$3(input.importance ?? (category === "stable_profile" ? .8 : .5), 0, 1),
+		emotion: clamp$3(input.emotion ?? 0, 0, 1),
+		tags: (input.tags ?? []).filter((tag) => tag.trim() !== "").slice(0, 12),
+		...input.factKey !== void 0 && input.factKey.trim() !== "" ? { factKey: input.factKey.trim().slice(0, 80) } : {},
+		createdAt: now$1,
+		...input.occurredAt === void 0 ? {} : { occurredAt: input.occurredAt },
+		activation0: 1,
+		activationAnchor: now$1,
+		recallCount: 0,
+		source: input.source ?? "chat",
+		visibility: input.visibility ?? "group"
+	};
+	let superseded;
+	if (item.factKey !== void 0) for (const old of group.items) {
+		if (old.supersededBy !== void 0 || old.factKey !== item.factKey) continue;
+		old.supersededBy = item.id;
+		superseded = old.id;
+	}
+	group.items.push(item);
+	group.updatedAt = now$1;
+	return {
+		ok: true,
+		item,
+		...superseded === void 0 ? {} : { superseded }
+	};
+}
+function recallMemories(store, groupId, query, options = {}) {
+	const now$1 = options.now ?? Date.now();
+	const policy = {
+		...DEFAULT_RECALL,
+		...options,
+		weights: {
+			...DEFAULT_RECALL.weights,
+			...options.weights ?? {}
+		}
+	};
+	const group = groupMemoryV3(store, groupId);
+	const queryTokens = tokenize(query);
+	const rejected = [];
+	if (queryTokens.length === 0) {
+		group.lastRecall = {
+			at: now$1,
+			query,
+			selected: [],
+			rejected: [],
+			chars: 0
+		};
+		return {
+			selected: [],
+			rejected,
+			chars: 0,
+			evidence: 0
+		};
+	}
+	const active = group.items.filter((item) => {
+		if (item.supersededBy !== void 0) {
+			rejected.push({
+				id: item.id,
+				reason: "superseded"
+			});
+			return false;
+		}
+		if (item.visibility === "owner" && !policy.includeOwner) {
+			rejected.push({
+				id: item.id,
+				reason: "owner-only"
+			});
+			return false;
+		}
+		return true;
+	});
+	const df = new Map();
+	for (const item of active) {
+		const words = new Set([...tokenize(item.text), ...item.tags.flatMap((tag) => tokenize(tag))]);
+		for (const word of words) df.set(word, (df.get(word) ?? 0) + 1);
+	}
+	const total = Math.max(1, active.length);
+	const scored = active.map((item) => {
+		const words = new Set([...tokenize(item.text), ...item.tags.flatMap((tag) => tokenize(tag))]);
+		let evidenceSum = 0;
+		for (const token of queryTokens) {
+			if (!words.has(token)) continue;
+			const rarity = Math.log((total + 1) / Math.max(1, df.get(token) ?? 1));
+			if (rarity > 0) evidenceSum += rarity;
+		}
+		const K = Math.max(.1, policy.rarityK);
+		let C = evidenceSum / (evidenceSum + K);
+		const normalizedQuery = query.trim().toLowerCase();
+		if (normalizedQuery.length >= 4 && item.text.toLowerCase().includes(normalizedQuery)) C = Math.max(C, .85);
+		const A = freshness(item, now$1, policy.baseHalfLifeDays);
+		const E = emotionFreshness(item, now$1, policy.emotionHalfLifeDays);
+		const I = item.importance;
+		const w = policy.weights;
+		const P = C * (w.baseline + w.activation * A + w.importance * I + w.emotion * E);
+		return {
+			item,
+			C,
+			P
+		};
+	});
+	const ranked = scored.sort((a, b) => b.P - a.P || b.C - a.C);
+	const selected = [];
+	let chars = 0;
+	let facts = 0;
+	let bestEvidence = 0;
+	for (const row of ranked) {
+		if (row.C < policy.threshold) {
+			rejected.push({
+				id: row.item.id,
+				reason: "evidence",
+				score: row.P
+			});
+			continue;
+		}
+		bestEvidence = Math.max(bestEvidence, row.C);
+		const isFact = row.item.category === "stable_profile" || row.item.category === "preference" || row.item.category === "relationship" || row.item.category === "inside_joke";
+		if (isFact && facts >= policy.maxFacts) {
+			rejected.push({
+				id: row.item.id,
+				reason: "facts-cap",
+				score: row.P
+			});
+			continue;
+		}
+		if (selected.length >= policy.maxItems) {
+			rejected.push({
+				id: row.item.id,
+				reason: "items-cap",
+				score: row.P
+			});
+			continue;
+		}
+		if (chars + row.item.text.length > policy.maxChars) {
+			rejected.push({
+				id: row.item.id,
+				reason: "chars-cap",
+				score: row.P
+			});
+			continue;
+		}
+		selected.push(row.item);
+		chars += row.item.text.length;
+		if (isFact) facts += 1;
+	}
+	for (const item of selected) {
+		item.recallCount += 1;
+		item.lastRecalledAt = now$1;
+		item.activationAnchor = now$1;
+		item.activation0 = clamp$3(item.activation0 + .2 * (1 - item.activation0), 0, 1);
+	}
+	group.lastRecall = {
+		at: now$1,
+		query,
+		selected: selected.map((item) => item.id),
+		rejected,
+		chars
+	};
+	group.updatedAt = now$1;
+	return {
+		selected,
+		rejected,
+		chars,
+		evidence: bestEvidence
+	};
+}
+function dateLabel(ts, now$1) {
+	const days = Math.floor((now$1 - ts) / DAY$1);
+	if (days <= 0) return "今天";
+	if (days === 1) return "昨天";
+	if (days < 7) return `${days} 天前`;
+	return new Date(ts).toLocaleDateString("zh-CN", {
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit"
+	});
+}
+function formatMemories(items, now$1 = Date.now()) {
+	if (items.length === 0) return "";
+	return items.map((item) => {
+		const label = item.category === "event" ? dateLabel(item.occurredAt ?? item.createdAt, now$1) : "长期";
+		const key = item.factKey === void 0 ? "" : `（${item.factKey}）`;
+		return `- [${label}]${key} ${item.text}`;
+	}).join("\n");
+}
+function listMemories(store, groupId) {
+	return [...store.groups[groupId]?.items ?? []].sort((a, b) => b.createdAt - a.createdAt);
+}
+function updateMemory(store, groupId, id, patch, now$1 = Date.now()) {
+	const group = groupMemoryV3(store, groupId);
+	const item = group.items.find((entry) => entry.id === id);
+	if (item === void 0) return void 0;
+	if (typeof patch.text === "string" && patch.text.trim() !== "") item.text = patch.text.trim().slice(0, 500);
+	if (patch.category !== void 0) item.category = patch.category;
+	if (patch.importance !== void 0) item.importance = clamp$3(patch.importance, 0, 1);
+	if (patch.factKey !== void 0) {
+		const key = patch.factKey.trim().slice(0, 80);
+		if (key === "") delete item.factKey;
+		else {
+			item.factKey = key;
+			for (const other of group.items) if (other.id !== item.id && other.supersededBy === void 0 && other.factKey === key) other.supersededBy = item.id;
+		}
+	}
+	group.updatedAt = now$1;
+	return item;
+}
+function deleteMemory(store, groupId, id, now$1 = Date.now()) {
+	const group = store.groups[groupId];
+	if (group === void 0) return false;
+	const before = group.items.length;
+	group.items = group.items.filter((item) => item.id !== id);
+	if (group.items.length === before) return false;
+	for (const item of group.items) if (item.supersededBy === id) delete item.supersededBy;
+	group.updatedAt = now$1;
+	return true;
+}
+function memoryStats(store, groupId) {
+	const group = store.groups[groupId];
+	const items = group?.items ?? [];
+	return {
+		total: items.length,
+		active: items.filter((item) => item.supersededBy === void 0).length,
+		stable: items.filter((item) => item.supersededBy === void 0 && item.category === "stable_profile").length,
+		...group?.lastRecall?.at === void 0 ? {} : { lastRecallAt: group.lastRecall.at }
+	};
+}
+function migrateLegacyMemories(store, groupId, legacy, summary, now$1 = Date.now()) {
+	const group = groupMemoryV3(store, groupId);
+	if (group.items.length > 0) return 0;
+	let added = 0;
+	for (const old of legacy) {
+		const text = String(old.text ?? "").trim();
+		if (text === "") continue;
+		const category = old.kind === "preference" || old.kind === "relationship" || old.kind === "inside_joke" ? old.kind : "stable_profile";
+		const result = rememberMemory(store, groupId, {
+			text,
+			category,
+			importance: clamp$3(old.confidence ?? .8, 0, 1),
+			source: "migration",
+			...old.createdAt === void 0 ? {} : { occurredAt: old.createdAt }
+		}, {
+			now: now$1,
+			dailyQuota: 0
+		});
+		if (result.ok) added += 1;
+	}
+	if (typeof summary === "string" && summary.trim() !== "") {
+		const result = rememberMemory(store, groupId, {
+			text: summary.trim().slice(0, 600),
+			category: "event",
+			importance: .35,
+			source: "migration"
+		}, {
+			now: now$1,
+			dailyQuota: 0
+		});
+		if (result.ok) added += 1;
+	}
+	if (added > 0) group.updatedAt = now$1;
+	return added;
+}
+
+//#endregion
 //#region src/qq/triggers.ts
 const DEFAULT_SCORE_WEIGHTS = {
 	base: 15,
@@ -3260,7 +3766,7 @@ function matchMember(userId, policy) {
 	if (userId === "") return void 0;
 	return policy.memberChances[userId];
 }
-const clamp$3 = (value, min, max) => Math.min(max, Math.max(min, value));
+const clamp$2 = (value, min, max) => Math.min(max, Math.max(min, value));
 function decideSpeak(input) {
 	const { state, policy, texts, now: now$1 } = input;
 	const reasons = [];
@@ -3331,12 +3837,12 @@ function decideSpeak(input) {
 		reasons.push(`引用别人 -${w.replyOtherPenalty}`);
 	}
 	if (input.profile !== void 0) {
-		const fam = Math.round(clamp$3(input.profile.familiarity, 0, 100) / 100 * w.familiarityMax);
+		const fam = Math.round(clamp$2(input.profile.familiarity, 0, 100) / 100 * w.familiarityMax);
 		if (fam !== 0) {
 			score += fam;
 			reasons.push(`熟识度 +${fam}`);
 		}
-		const aff = Math.round(clamp$3(input.profile.affinity, -100, 100) / 100 * w.affinityMax);
+		const aff = Math.round(clamp$2(input.profile.affinity, -100, 100) / 100 * w.affinityMax);
 		if (aff !== 0) {
 			score += aff;
 			reasons.push(`好感度 ${aff > 0 ? "+" : ""}${aff}`);
@@ -3365,7 +3871,7 @@ function decideSpeak(input) {
 			}
 		}
 	}
-	score = clamp$3(score, 0, 100);
+	score = clamp$2(score, 0, 100);
 	if (input.rules?.whitelist === true) {
 		score = Math.max(score, input.rules.whitelistFloor);
 		reasons.push(`白名单抬到 ${input.rules.whitelistFloor}`);
@@ -3628,8 +4134,8 @@ function runWorker(python, args, timeoutMs, signal) {
 
 //#endregion
 //#region src/qq/profiles.ts
-const DAY$1 = 24 * 60 * 6e4;
-const WEEK = 7 * DAY$1;
+const DAY = 24 * 60 * 6e4;
+const WEEK = 7 * DAY;
 const DEFAULT_PROFILE_RULES = {
 	firstMessageFam: 2,
 	repeatMessageFam: .1,
@@ -3662,7 +4168,7 @@ function emptyProfiles() {
 		groups: {}
 	};
 }
-const clamp$2 = (value, min, max) => Math.min(max, Math.max(min, value));
+const clamp$1 = (value, min, max) => Math.min(max, Math.max(min, value));
 function readProfiles(path) {
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
@@ -3678,8 +4184,8 @@ function readProfiles(path) {
 				users[qq] = {
 					qq,
 					name: typeof p.name === "string" ? p.name : qq,
-					familiarity: clamp$2(p.familiarity, 0, 100),
-					affinity: clamp$2(typeof p.affinity === "number" ? p.affinity : 0, -100, 100),
+					familiarity: clamp$1(p.familiarity, 0, 100),
+					affinity: clamp$1(typeof p.affinity === "number" ? p.affinity : 0, -100, 100),
 					messages: Math.max(0, Number(p.messages) || 0),
 					mentions: Math.max(0, Number(p.mentions) || 0),
 					replies: Math.max(0, Number(p.replies) || 0),
@@ -3746,15 +4252,15 @@ function applyDecay(profile, now$1, rules = DEFAULT_PROFILE_RULES) {
 	if (profile.lastSeen <= 0) return;
 	const base = Math.max(profile.lastSeen, profile.decayedThrough ?? 0);
 	const famDays = Math.max(0, rules.inactiveDaysBeforeFamDecay);
-	const famStart = Math.max(base, profile.lastSeen + famDays * DAY$1);
+	const famStart = Math.max(base, profile.lastSeen + famDays * DAY);
 	const famWeeks = Math.floor((now$1 - famStart) / WEEK);
 	if (famWeeks > 0 && profile.familiarity > 0 && rules.famDecayPerWeek > 0) profile.familiarity = Math.max(Math.max(0, rules.famDecayFloor), profile.familiarity - famWeeks * rules.famDecayPerWeek);
 	const affDays = Math.max(0, rules.inactiveDaysBeforeAffinityDecay);
-	const affStart = Math.max(base, profile.lastSeen + affDays * DAY$1);
+	const affStart = Math.max(base, profile.lastSeen + affDays * DAY);
 	const affWeeks = Math.floor((now$1 - affStart) / WEEK);
 	if (affWeeks > 0 && rules.affinityDecayPerWeek > 0) {
-		if (profile.affinity > 0) profile.affinity = clamp$2(profile.affinity - affWeeks * rules.affinityDecayPerWeek, 0, 100);
-		else if (profile.affinity < 0) profile.affinity = clamp$2(profile.affinity + affWeeks * rules.affinityDecayPerWeek, -100, 0);
+		if (profile.affinity > 0) profile.affinity = clamp$1(profile.affinity - affWeeks * rules.affinityDecayPerWeek, 0, 100);
+		else if (profile.affinity < 0) profile.affinity = clamp$1(profile.affinity + affWeeks * rules.affinityDecayPerWeek, -100, 0);
 	}
 	profile.decayedThrough = now$1;
 }
@@ -3779,7 +4285,7 @@ function touchUser(profiles, groupId, qq, name$1, options = {}) {
 	}
 	applyDecay(profile, now$1, rules);
 	if (profile.seeded !== true) {
-		const initial = clamp$2(options.initialAffinity ?? 0, -100, 100);
+		const initial = clamp$1(options.initialAffinity ?? 0, -100, 100);
 		profile.affinity = Math.max(profile.affinity, initial);
 		profile.seeded = true;
 	}
@@ -3794,7 +4300,7 @@ function touchUser(profiles, groupId, qq, name$1, options = {}) {
 	const famGain = cappedGain(famValue, rules.messageFamDailyCap, stats.famGain);
 	if (famGain > 0) {
 		stats.famGain += famGain;
-		profile.familiarity = clamp$2(profile.familiarity + famGain, 0, 100);
+		profile.familiarity = clamp$1(profile.familiarity + famGain, 0, 100);
 	}
 	if (!profile.days.includes(day)) profile.days = [...profile.days.slice(-59), day];
 	if (options.mention === true) {
@@ -3802,7 +4308,7 @@ function touchUser(profiles, groupId, qq, name$1, options = {}) {
 		const mentionGain = cappedGain(rules.mentionFam, rules.mentionFamDailyCap, stats.mentionGain);
 		if (mentionGain > 0) {
 			stats.mentionGain += mentionGain;
-			profile.familiarity = clamp$2(profile.familiarity + mentionGain, 0, 100);
+			profile.familiarity = clamp$1(profile.familiarity + mentionGain, 0, 100);
 		}
 	}
 	const entries = Object.entries(group.users);
@@ -3820,13 +4326,13 @@ function noteReply(profiles, groupId, qq, rules = DEFAULT_PROFILE_RULES) {
 	const famGain = cappedGain(rules.replyFam, rules.replyFamDailyCap, stats.replyGain);
 	if (famGain > 0) {
 		stats.replyGain += famGain;
-		profile.familiarity = clamp$2(profile.familiarity + famGain, 0, 100);
+		profile.familiarity = clamp$1(profile.familiarity + famGain, 0, 100);
 	}
 	const affGain = cappedGain(rules.replyAffinity, rules.replyAffinityDailyCap, stats.replyAffGain ?? 0);
 	if (affGain > 0) {
 		stats.replyAffGain = (stats.replyAffGain ?? 0) + affGain;
 		stats.affGain += affGain;
-		profile.affinity = clamp$2(profile.affinity + affGain, -100, 100);
+		profile.affinity = clamp$1(profile.affinity + affGain, -100, 100);
 	}
 	profile.replies += 1;
 	return profile;
@@ -3840,7 +4346,7 @@ function noteContinuation(profiles, groupId, qq, rules = DEFAULT_PROFILE_RULES) 
 	if (gain > 0) {
 		stats.continuationAffGain = (stats.continuationAffGain ?? 0) + gain;
 		stats.affGain += gain;
-		profile.affinity = clamp$2(profile.affinity + gain, -100, 100);
+		profile.affinity = clamp$1(profile.affinity + gain, -100, 100);
 	}
 	return profile;
 }
@@ -3853,7 +4359,7 @@ function noteQuote(profiles, groupId, qq, rules = DEFAULT_PROFILE_RULES) {
 	if (gain > 0) {
 		stats.quoteAffGain = (stats.quoteAffGain ?? 0) + gain;
 		stats.affGain += gain;
-		profile.affinity = clamp$2(profile.affinity + gain, -100, 100);
+		profile.affinity = clamp$1(profile.affinity + gain, -100, 100);
 	}
 	return profile;
 }
@@ -3866,7 +4372,7 @@ function noteHostility(profiles, groupId, qq, severity, rules = DEFAULT_PROFILE_
 	const loss = cappedGain(baseLoss, rules.hostilityDailyCap, stats.hostilityLoss ?? 0);
 	if (loss > 0) {
 		stats.hostilityLoss = (stats.hostilityLoss ?? 0) + loss;
-		profile.affinity = clamp$2(profile.affinity - loss, -100, 100);
+		profile.affinity = clamp$1(profile.affinity - loss, -100, 100);
 	}
 	return profile;
 }
@@ -4781,7 +5287,7 @@ const MOOD_DIMS = [
 	"sad",
 	"jealous"
 ];
-const clamp$1 = (value, min, max) => Math.min(max, Math.max(min, value));
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 function defaultDims() {
 	return Object.fromEntries(MOOD_DIMS.map((key) => [key, 0]));
 }
@@ -4802,15 +5308,15 @@ function readMoodStore(path) {
 			const dims = defaultDims();
 			for (const key of MOOD_DIMS) {
 				const value = item.dims?.[key];
-				dims[key] = typeof value === "number" && Number.isFinite(value) ? clamp$1(value, -100, 100) : 0;
+				dims[key] = typeof value === "number" && Number.isFinite(value) ? clamp(value, -100, 100) : 0;
 			}
 			groups[groupId] = {
-				mood: clamp$1(item.mood, 0, 100),
-				baseline: clamp$1(typeof item.baseline === "number" ? item.baseline : 70, 0, 100),
-				floor: clamp$1(typeof item.floor === "number" ? item.floor : 0, 0, 100),
+				mood: clamp(item.mood, 0, 100),
+				baseline: clamp(typeof item.baseline === "number" ? item.baseline : 70, 0, 100),
+				floor: clamp(typeof item.floor === "number" ? item.floor : 0, 0, 100),
 				dims,
 				lastReason: typeof item.lastReason === "string" ? item.lastReason : "",
-				lastConfidence: clamp$1(typeof item.lastConfidence === "number" ? item.lastConfidence : 0, 0, 100),
+				lastConfidence: clamp(typeof item.lastConfidence === "number" ? item.lastConfidence : 0, 0, 100),
 				lastDelta: typeof item.lastDelta === "number" ? item.lastDelta : 0,
 				updatedAt: typeof item.updatedAt === "number" ? item.updatedAt : Date.now(),
 				lastDecayAt: typeof item.lastDecayAt === "number" ? item.lastDecayAt : Date.now(),
@@ -4834,8 +5340,8 @@ function writeMoodStore(path, store) {
 }
 function groupMood(store, groupId, rules = {}, now$1 = Date.now()) {
 	const existing = store.groups[groupId];
-	const baseline = clamp$1(rules.baseline ?? existing?.baseline ?? 70, 0, 100);
-	const floor = clamp$1(rules.floor ?? existing?.floor ?? 0, 0, 100);
+	const baseline = clamp(rules.baseline ?? existing?.baseline ?? 70, 0, 100);
+	const floor = clamp(rules.floor ?? existing?.floor ?? 0, 0, 100);
 	if (existing !== void 0) {
 		existing.baseline = baseline;
 		existing.floor = floor;
@@ -4857,7 +5363,7 @@ function groupMood(store, groupId, rules = {}, now$1 = Date.now()) {
 	store.groups[groupId] = created;
 	return created;
 }
-function dayKey$2(ts) {
+function dayKey$1(ts) {
 	return new Date(ts).toISOString().slice(0, 10);
 }
 function decayMood(state, now$1, rules = {}) {
@@ -4867,9 +5373,9 @@ function decayMood(state, now$1, rules = {}) {
 	const factor = Math.pow(.5, hours / halfLife);
 	const beforeMood = state.mood;
 	const beforeDims = { ...state.dims };
-	state.mood = clamp$1(state.baseline + (state.mood - state.baseline) * factor, 0, 100);
+	state.mood = clamp(state.baseline + (state.mood - state.baseline) * factor, 0, 100);
 	if (state.mood < state.floor) state.mood = state.floor;
-	for (const key of MOOD_DIMS) state.dims[key] = clamp$1(state.dims[key] * factor, -100, 100);
+	for (const key of MOOD_DIMS) state.dims[key] = clamp(state.dims[key] * factor, -100, 100);
 	state.lastDecayAt = now$1;
 	state.updatedAt = now$1;
 	const changed = Math.abs(state.mood - beforeMood) >= 1 || MOOD_DIMS.some((key) => Math.abs(state.dims[key] - beforeDims[key]) >= 1);
@@ -4888,19 +5394,19 @@ function decayMood(state, now$1, rules = {}) {
 	}
 }
 function applyMoodJudgement(state, judgement, now$1 = Date.now()) {
-	const delta = clamp$1(Number(judgement.moodDelta) || 0, -10, 10) / 3;
+	const delta = clamp(Number(judgement.moodDelta) || 0, -10, 10) / 3;
 	const dims = {};
 	for (const key of MOOD_DIMS) {
 		const value = Number(judgement.dims?.[key] ?? 0);
 		if (!Number.isFinite(value) || Math.abs(value) < .1) continue;
-		const applied = clamp$1(value, -10, 10);
+		const applied = clamp(value, -10, 10);
 		dims[key] = applied;
-		state.dims[key] = clamp$1(state.dims[key] + applied, -100, 100);
+		state.dims[key] = clamp(state.dims[key] + applied, -100, 100);
 	}
 	if (Math.abs(delta) < .01 && Object.keys(dims).length === 0) return { changed: false };
-	state.mood = clamp$1(state.mood + delta, Math.max(0, state.floor), 100);
+	state.mood = clamp(state.mood + delta, Math.max(0, state.floor), 100);
 	state.lastReason = String(judgement.reason ?? "").trim().slice(0, 300);
-	state.lastConfidence = clamp$1(Number(judgement.confidence) || 0, 0, 100);
+	state.lastConfidence = clamp(Number(judgement.confidence) || 0, 0, 100);
 	state.lastDelta = delta;
 	state.updatedAt = now$1;
 	const event = {
@@ -4968,8 +5474,8 @@ function moodInjection(state, rules = {}, now$1 = Date.now()) {
 		line: "",
 		reason: "not-significant"
 	};
-	const today$1 = dayKey$2(now$1);
-	const saidToday = state.saidAt.filter((ts) => dayKey$2(ts) === today$1).length;
+	const today$1 = dayKey$1(now$1);
+	const saidToday = state.saidAt.filter((ts) => dayKey$1(ts) === today$1).length;
 	if (saidToday >= (rules.dailyInject ?? 6)) return {
 		inject: false,
 		line: "",
@@ -4988,10 +5494,10 @@ function markMoodInjected(state, now$1 = Date.now()) {
 	if (state.saidAt.length > 200) state.saidAt = state.saidAt.slice(-200);
 }
 function resetMood(state, rules = {}, now$1 = Date.now()) {
-	const baseline = clamp$1(rules.baseline ?? state.baseline, 0, 100);
+	const baseline = clamp(rules.baseline ?? state.baseline, 0, 100);
 	state.mood = baseline;
 	state.baseline = baseline;
-	state.floor = clamp$1(rules.floor ?? state.floor, 0, 100);
+	state.floor = clamp(rules.floor ?? state.floor, 0, 100);
 	state.dims = defaultDims();
 	state.lastReason = "";
 	state.lastConfidence = 0;
@@ -5014,479 +5520,6 @@ function moodSnapshot(state) {
 		updatedAt: state.updatedAt,
 		timeline: state.timeline.slice(-40)
 	};
-}
-
-//#endregion
-//#region src/qq/memory-v3.ts
-const DAY = 24 * 60 * 6e4;
-const DEFAULT_RECALL = {
-	maxItems: 6,
-	maxChars: 800,
-	maxFacts: 2,
-	threshold: .35,
-	rarityK: 1,
-	weights: {
-		baseline: .55,
-		activation: .25,
-		importance: .15,
-		emotion: .05
-	},
-	baseHalfLifeDays: 30,
-	emotionHalfLifeDays: 7,
-	includeOwner: false
-};
-const STOPWORDS = new Set([
-	"的",
-	"了",
-	"是",
-	"在",
-	"和",
-	"与",
-	"也",
-	"就",
-	"都",
-	"而",
-	"及",
-	"或",
-	"一个",
-	"一下",
-	"这个",
-	"那个",
-	"这些",
-	"那些",
-	"我",
-	"你",
-	"您",
-	"他",
-	"她",
-	"它",
-	"我们",
-	"你们",
-	"他们",
-	"什么",
-	"怎么",
-	"为什么",
-	"吗",
-	"呢",
-	"啊",
-	"呀",
-	"吧",
-	"嘛",
-	"在吗",
-	"有人",
-	"今天",
-	"现在",
-	"刚刚",
-	"就是",
-	"不是",
-	"可以",
-	"不能",
-	"会",
-	"要",
-	"有",
-	"没",
-	"没有"
-]);
-function tokenize(text) {
-	const normalized = String(text ?? "").toLowerCase();
-	const out = new Set();
-	try {
-		const Segmenter = Intl.Segmenter;
-		if (Segmenter !== void 0) {
-			const segmenter = new Segmenter("zh", { granularity: "word" });
-			for (const part of segmenter.segment(normalized)) {
-				const word = part.segment.trim();
-				if (word === "" || part.isWordLike === false && !/[\u4e00-\u9fff]/.test(word)) continue;
-				if (/^[\p{P}\p{S}\s]+$/u.test(word)) continue;
-				if (STOPWORDS.has(word)) continue;
-				if (word.length === 1 && !/[\u4e00-\u9fff]/.test(word)) continue;
-				out.add(word);
-			}
-		}
-	} catch {}
-	if (out.size === 0) for (const word of normalized.split(/[^\p{L}\p{N}]+/u)) {
-		const value = word.trim();
-		if (value !== "" && !STOPWORDS.has(value)) out.add(value);
-	}
-	return [...out];
-}
-function emptyMemoryStore() {
-	return {
-		version: 3,
-		groups: {}
-	};
-}
-function groupMemoryV3(store, groupId) {
-	const existing = store.groups[groupId];
-	if (existing !== void 0) return existing;
-	const created = {
-		items: [],
-		updatedAt: Date.now()
-	};
-	store.groups[groupId] = created;
-	return created;
-}
-function readMemoryStore(path) {
-	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
-		if (parsed === null || typeof parsed !== "object" || parsed.version !== 3 || typeof parsed.groups !== "object" || parsed.groups === null) return emptyMemoryStore();
-		const groups = {};
-		for (const [groupId, raw] of Object.entries(parsed.groups)) {
-			const group = raw;
-			if (!Array.isArray(group?.items)) continue;
-			groups[groupId] = {
-				items: group.items.filter((item) => normalizeMemory(item) !== void 0).map((item) => normalizeMemory(item)),
-				...group.lastRecall !== null && typeof group.lastRecall === "object" ? { lastRecall: group.lastRecall } : {},
-				updatedAt: typeof group.updatedAt === "number" ? group.updatedAt : Date.now()
-			};
-		}
-		return {
-			version: 3,
-			groups
-		};
-	} catch {
-		return emptyMemoryStore();
-	}
-}
-function writeMemoryStore(path, store) {
-	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(store)}\n`, "utf8");
-	renameSync(tmp, path);
-}
-function normalizeMemory(raw) {
-	if (raw === null || typeof raw !== "object") return void 0;
-	const item = raw;
-	if (typeof item.id !== "string" || typeof item.text !== "string" || item.text.trim() === "") return void 0;
-	const category = item.category === "stable_profile" || item.category === "preference" || item.category === "relationship" || item.category === "inside_joke" ? item.category : "event";
-	const created = typeof item.createdAt === "number" ? item.createdAt : Date.now();
-	return {
-		id: item.id,
-		text: item.text.trim(),
-		category,
-		importance: clamp(numberOr(item.importance, .5), 0, 1),
-		emotion: clamp(numberOr(item.emotion, 0), 0, 1),
-		tags: Array.isArray(item.tags) ? item.tags.filter((tag) => typeof tag === "string" && tag.trim() !== "").slice(0, 12) : [],
-		...typeof item.factKey === "string" && item.factKey.trim() !== "" ? { factKey: item.factKey.trim().slice(0, 80) } : {},
-		...typeof item.supersededBy === "string" && item.supersededBy !== "" ? { supersededBy: item.supersededBy } : {},
-		createdAt: created,
-		...typeof item.occurredAt === "number" ? { occurredAt: item.occurredAt } : {},
-		activation0: clamp(numberOr(item.activation0, 1), 0, 1),
-		activationAnchor: typeof item.activationAnchor === "number" ? item.activationAnchor : created,
-		recallCount: Math.max(0, Math.round(numberOr(item.recallCount, 0))),
-		...typeof item.lastRecalledAt === "number" ? { lastRecalledAt: item.lastRecalledAt } : {},
-		source: item.source === "summary" || item.source === "manual" || item.source === "import" || item.source === "migration" ? item.source : "chat",
-		visibility: item.visibility === "owner" ? "owner" : "group"
-	};
-}
-function numberOr(value, fallback) {
-	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-function clamp(value, min, max) {
-	return Math.min(max, Math.max(min, value));
-}
-function freshness(item, now$1, halfLifeDays) {
-	if (item.category === "stable_profile") return item.activation0;
-	const anchor = item.activationAnchor || item.createdAt;
-	const days = Math.max(0, (now$1 - anchor) / DAY);
-	const life = Math.max(1, halfLifeDays) * (1 + 2 * item.importance);
-	return clamp(item.activation0 * Math.pow(2, -days / life), 0, 1);
-}
-function emotionFreshness(item, now$1, halfLifeDays) {
-	if (item.emotion <= 0) return 0;
-	const anchor = item.occurredAt ?? item.createdAt;
-	const days = Math.max(0, (now$1 - anchor) / DAY);
-	return clamp(item.emotion * Math.pow(2, -days / Math.max(.5, halfLifeDays)), 0, 1);
-}
-function dayKey$1(ts) {
-	return new Date(ts).toISOString().slice(0, 10);
-}
-function rememberMemory(store, groupId, input, options = {}) {
-	const now$1 = options.now ?? Date.now();
-	const text = String(input.text ?? "").trim().slice(0, 500);
-	if (text === "") return {
-		ok: false,
-		reason: "empty"
-	};
-	const group = groupMemoryV3(store, groupId);
-	const normalized = text.toLowerCase().replace(/\s+/g, "");
-	if (group.items.some((item$1) => item$1.supersededBy === void 0 && item$1.text.toLowerCase().replace(/\s+/g, "") === normalized)) return {
-		ok: false,
-		reason: "duplicate"
-	};
-	const quota = options.dailyQuota ?? 8;
-	if (quota > 0) {
-		const today$1 = dayKey$1(now$1);
-		const count = group.items.filter((item$1) => item$1.source === "chat" && dayKey$1(item$1.createdAt) === today$1).length;
-		if (count >= quota) return {
-			ok: false,
-			reason: "quota"
-		};
-	}
-	const category = input.category ?? "event";
-	const item = {
-		id: input.id ?? `m-${now$1.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-		text,
-		category,
-		importance: clamp(input.importance ?? (category === "stable_profile" ? .8 : .5), 0, 1),
-		emotion: clamp(input.emotion ?? 0, 0, 1),
-		tags: (input.tags ?? []).filter((tag) => tag.trim() !== "").slice(0, 12),
-		...input.factKey !== void 0 && input.factKey.trim() !== "" ? { factKey: input.factKey.trim().slice(0, 80) } : {},
-		createdAt: now$1,
-		...input.occurredAt === void 0 ? {} : { occurredAt: input.occurredAt },
-		activation0: 1,
-		activationAnchor: now$1,
-		recallCount: 0,
-		source: input.source ?? "chat",
-		visibility: input.visibility ?? "group"
-	};
-	let superseded;
-	if (item.factKey !== void 0) for (const old of group.items) {
-		if (old.supersededBy !== void 0 || old.factKey !== item.factKey) continue;
-		old.supersededBy = item.id;
-		superseded = old.id;
-	}
-	group.items.push(item);
-	group.updatedAt = now$1;
-	return {
-		ok: true,
-		item,
-		...superseded === void 0 ? {} : { superseded }
-	};
-}
-function recallMemories(store, groupId, query, options = {}) {
-	const now$1 = options.now ?? Date.now();
-	const policy = {
-		...DEFAULT_RECALL,
-		...options,
-		weights: {
-			...DEFAULT_RECALL.weights,
-			...options.weights ?? {}
-		}
-	};
-	const group = groupMemoryV3(store, groupId);
-	const queryTokens = tokenize(query);
-	const rejected = [];
-	if (queryTokens.length === 0) {
-		group.lastRecall = {
-			at: now$1,
-			query,
-			selected: [],
-			rejected: [],
-			chars: 0
-		};
-		return {
-			selected: [],
-			rejected,
-			chars: 0,
-			evidence: 0
-		};
-	}
-	const active = group.items.filter((item) => {
-		if (item.supersededBy !== void 0) {
-			rejected.push({
-				id: item.id,
-				reason: "superseded"
-			});
-			return false;
-		}
-		if (item.visibility === "owner" && !policy.includeOwner) {
-			rejected.push({
-				id: item.id,
-				reason: "owner-only"
-			});
-			return false;
-		}
-		return true;
-	});
-	const df = new Map();
-	for (const item of active) {
-		const words = new Set([...tokenize(item.text), ...item.tags.flatMap((tag) => tokenize(tag))]);
-		for (const word of words) df.set(word, (df.get(word) ?? 0) + 1);
-	}
-	const total = Math.max(1, active.length);
-	const scored = active.map((item) => {
-		const words = new Set([...tokenize(item.text), ...item.tags.flatMap((tag) => tokenize(tag))]);
-		let evidenceSum = 0;
-		for (const token of queryTokens) {
-			if (!words.has(token)) continue;
-			const rarity = Math.log((total + 1) / Math.max(1, df.get(token) ?? 1));
-			if (rarity > 0) evidenceSum += rarity;
-		}
-		const K = Math.max(.1, policy.rarityK);
-		let C = evidenceSum / (evidenceSum + K);
-		const normalizedQuery = query.trim().toLowerCase();
-		if (normalizedQuery.length >= 4 && item.text.toLowerCase().includes(normalizedQuery)) C = Math.max(C, .85);
-		const A = freshness(item, now$1, policy.baseHalfLifeDays);
-		const E = emotionFreshness(item, now$1, policy.emotionHalfLifeDays);
-		const I = item.importance;
-		const w = policy.weights;
-		const P = C * (w.baseline + w.activation * A + w.importance * I + w.emotion * E);
-		return {
-			item,
-			C,
-			P
-		};
-	});
-	const ranked = scored.sort((a, b) => b.P - a.P || b.C - a.C);
-	const selected = [];
-	let chars = 0;
-	let facts = 0;
-	let bestEvidence = 0;
-	for (const row of ranked) {
-		if (row.C < policy.threshold) {
-			rejected.push({
-				id: row.item.id,
-				reason: "evidence",
-				score: row.P
-			});
-			continue;
-		}
-		bestEvidence = Math.max(bestEvidence, row.C);
-		const isFact = row.item.category === "stable_profile" || row.item.category === "preference" || row.item.category === "relationship" || row.item.category === "inside_joke";
-		if (isFact && facts >= policy.maxFacts) {
-			rejected.push({
-				id: row.item.id,
-				reason: "facts-cap",
-				score: row.P
-			});
-			continue;
-		}
-		if (selected.length >= policy.maxItems) {
-			rejected.push({
-				id: row.item.id,
-				reason: "items-cap",
-				score: row.P
-			});
-			continue;
-		}
-		if (chars + row.item.text.length > policy.maxChars) {
-			rejected.push({
-				id: row.item.id,
-				reason: "chars-cap",
-				score: row.P
-			});
-			continue;
-		}
-		selected.push(row.item);
-		chars += row.item.text.length;
-		if (isFact) facts += 1;
-	}
-	for (const item of selected) {
-		item.recallCount += 1;
-		item.lastRecalledAt = now$1;
-		item.activationAnchor = now$1;
-		item.activation0 = clamp(item.activation0 + .2 * (1 - item.activation0), 0, 1);
-	}
-	group.lastRecall = {
-		at: now$1,
-		query,
-		selected: selected.map((item) => item.id),
-		rejected,
-		chars
-	};
-	group.updatedAt = now$1;
-	return {
-		selected,
-		rejected,
-		chars,
-		evidence: bestEvidence
-	};
-}
-function dateLabel(ts, now$1) {
-	const days = Math.floor((now$1 - ts) / DAY);
-	if (days <= 0) return "今天";
-	if (days === 1) return "昨天";
-	if (days < 7) return `${days} 天前`;
-	return new Date(ts).toLocaleDateString("zh-CN", {
-		year: "numeric",
-		month: "2-digit",
-		day: "2-digit"
-	});
-}
-function formatMemories(items, now$1 = Date.now()) {
-	if (items.length === 0) return "";
-	return items.map((item) => {
-		const label = item.category === "event" ? dateLabel(item.occurredAt ?? item.createdAt, now$1) : "长期";
-		const key = item.factKey === void 0 ? "" : `（${item.factKey}）`;
-		return `- [${label}]${key} ${item.text}`;
-	}).join("\n");
-}
-function listMemories(store, groupId) {
-	return [...store.groups[groupId]?.items ?? []].sort((a, b) => b.createdAt - a.createdAt);
-}
-function updateMemory(store, groupId, id, patch, now$1 = Date.now()) {
-	const group = groupMemoryV3(store, groupId);
-	const item = group.items.find((entry) => entry.id === id);
-	if (item === void 0) return void 0;
-	if (typeof patch.text === "string" && patch.text.trim() !== "") item.text = patch.text.trim().slice(0, 500);
-	if (patch.category !== void 0) item.category = patch.category;
-	if (patch.importance !== void 0) item.importance = clamp(patch.importance, 0, 1);
-	if (patch.factKey !== void 0) {
-		const key = patch.factKey.trim().slice(0, 80);
-		if (key === "") delete item.factKey;
-		else {
-			item.factKey = key;
-			for (const other of group.items) if (other.id !== item.id && other.supersededBy === void 0 && other.factKey === key) other.supersededBy = item.id;
-		}
-	}
-	group.updatedAt = now$1;
-	return item;
-}
-function deleteMemory(store, groupId, id, now$1 = Date.now()) {
-	const group = store.groups[groupId];
-	if (group === void 0) return false;
-	const before = group.items.length;
-	group.items = group.items.filter((item) => item.id !== id);
-	if (group.items.length === before) return false;
-	for (const item of group.items) if (item.supersededBy === id) delete item.supersededBy;
-	group.updatedAt = now$1;
-	return true;
-}
-function memoryStats(store, groupId) {
-	const group = store.groups[groupId];
-	const items = group?.items ?? [];
-	return {
-		total: items.length,
-		active: items.filter((item) => item.supersededBy === void 0).length,
-		stable: items.filter((item) => item.supersededBy === void 0 && item.category === "stable_profile").length,
-		...group?.lastRecall?.at === void 0 ? {} : { lastRecallAt: group.lastRecall.at }
-	};
-}
-function migrateLegacyMemories(store, groupId, legacy, summary, now$1 = Date.now()) {
-	const group = groupMemoryV3(store, groupId);
-	if (group.items.length > 0) return 0;
-	let added = 0;
-	for (const old of legacy) {
-		const text = String(old.text ?? "").trim();
-		if (text === "") continue;
-		const category = old.kind === "preference" || old.kind === "relationship" || old.kind === "inside_joke" ? old.kind : "stable_profile";
-		const result = rememberMemory(store, groupId, {
-			text,
-			category,
-			importance: clamp(old.confidence ?? .8, 0, 1),
-			source: "migration",
-			...old.createdAt === void 0 ? {} : { occurredAt: old.createdAt }
-		}, {
-			now: now$1,
-			dailyQuota: 0
-		});
-		if (result.ok) added += 1;
-	}
-	if (typeof summary === "string" && summary.trim() !== "") {
-		const result = rememberMemory(store, groupId, {
-			text: summary.trim().slice(0, 600),
-			category: "event",
-			importance: .35,
-			source: "migration"
-		}, {
-			now: now$1,
-			dailyQuota: 0
-		});
-		if (result.ok) added += 1;
-	}
-	if (added > 0) group.updatedAt = now$1;
-	return added;
 }
 
 //#endregion
@@ -9353,6 +9386,39 @@ var QqBridge = class {
 				voiceNote,
 				message.text
 			].filter((part) => part !== "").join("\n");
+			/**
+			
+			* 先记账，再交接。
+			
+			*
+			
+			* 2026-10-29 修：以前 worldSay 成功就直接 return，
+			
+			* 而 appendMemoryTurn / recordTurn 写在这段后面，永远执行不到。
+			
+			* 于是主人私聊在插件记忆里只有她自己的回复、没有主人说的话。
+			
+			* 现在把「主人这句」先落进两个共用账本，再交给家会话：
+			
+			*   - qq-memory（群聊那套读的就是它）
+			
+			*   - 共用轮次（群聊提示词里的「最近说过的话」）
+			
+			*/
+			if (message.text.trim() !== "") {
+				this.appendMemoryTurn(sessionKey, {
+					role: "user",
+					name: name$1,
+					text: message.text.slice(0, 500),
+					ts: now$1
+				});
+				this.deps.memoryHub?.recordTurn({
+					role: "user",
+					content: message.text,
+					session: sessionKey,
+					name: name$1
+				});
+			}
 			if (this.deps.worldSay?.(worldText, {
 				voice: asksForVoice(message.text),
 				sticker: asksToSendImage(message.text),
@@ -11071,7 +11137,8 @@ var QqBridge = class {
 	*/
 	sharedTranscriptNote(kind, currentKey, revealOk = false) {
 		if (this.deps.sharedTranscript?.() !== true) return "";
-		const LIMIT = 12;
+		const configured = this.deps.sharedTranscriptTurns?.() ?? 12;
+		const LIMIT = configured <= 0 ? 5e3 : Math.min(5e3, Math.max(1, configured));
 		const lines = [];
 		for (const [key, group] of Object.entries(this.memory.groups ?? {})) {
 			if (key === currentKey) continue;
@@ -12695,6 +12762,7 @@ const DEFAULT_SETTINGS = {
 	worldBridge: {
 		enabled: false,
 		worldId: "default",
+		privateWorldId: "",
 		worldDir: "",
 		privateBackend: "chat",
 		wakeOnStart: false,
@@ -12865,6 +12933,7 @@ function readSettings(root) {
 				return {
 					enabled: source.enabled === true,
 					worldId: typeof source.worldId === "string" && source.worldId.trim() !== "" ? source.worldId.trim().slice(0, 80) : "default",
+					privateWorldId: typeof source.privateWorldId === "string" ? source.privateWorldId.trim().slice(0, 80) : "",
 					worldDir: typeof source.worldDir === "string" ? source.worldDir.trim().slice(0, 500) : "",
 					privateBackend: source.privateBackend === "world" || source.privateBackend === "plugin" ? source.privateBackend : "chat",
 					wakeOnStart: source.wakeOnStart === true,
@@ -12977,7 +13046,7 @@ function readSettings(root) {
 				const src = raw.sharedTranscript !== null && typeof raw.sharedTranscript === "object" ? raw.sharedTranscript : {};
 				return {
 					enabled: src.enabled === true,
-					turns: clampNumber(src.turns, 0, 40, DEFAULT_SETTINGS.sharedTranscript.turns),
+					turns: clampNumber(src.turns, 0, 5e3, DEFAULT_SETTINGS.sharedTranscript.turns),
 					revealToGroup: src.revealToGroup === true
 				};
 			})()
@@ -13869,8 +13938,8 @@ ${recentPosts}`
 			const policy = readMemoryPolicy(dir);
 			if (!policy.ok) return "";
 			const turns = readRecentTurns(dir, {
-				limit: Math.max(4, Math.min(20, limit$1 ?? policy.policy.contextTurns)),
-				days: 2
+				limit: Math.max(4, Math.min(500, limit$1 ?? policy.policy.contextTurns)),
+				days: 7
 			});
 			return turns.map((turn) => `${turn.role === "assistant" ? "她" : "对方"}：${turn.content.replace(/\s+/gu, " ").trim().slice(0, 200)}`).join("\n");
 		}
@@ -13880,6 +13949,7 @@ ${recentPosts}`
 		persona: (groupId) => activePersona(readSettings(root), groupId),
 		ownerPriority: () => readSettings(root).ownerPriorityPrompt,
 		sharedTranscript: () => readSettings(root).sharedTranscript.enabled === true,
+		sharedTranscriptTurns: () => readSettings(root).sharedTranscript.turns,
 		revealPrivateInGroup: () => readSettings(root).sharedTranscript.revealToGroup === true,
 		tracePoke: () => {
 			const now$1 = Date.now();
@@ -13900,7 +13970,7 @@ ${recentPosts}`
 				if (backlog >= 30) extractGroupTraces();
 			} catch {}
 		},
-		traceRecall: (query) => recallForChat(traceStoreDir(), query, 6).map((trace) => `${trace.domain === "group" ? "群聊" : "和主人"}｜重要 ${trace.importance.toFixed(1)}｜想起 ${trace.recallCount} 次：${trace.text.replace(/\n/gu, " / ").slice(0, 300)}`),
+		traceRecall: (query) => recallForChat(traceStoreDir(), query, 6).map((trace) => `${trace.domain === "group" ? "群聊" : "和主人"}${trace.happenedAt ? `｜${new Date(trace.happenedAt).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}` : ""}${trace.people !== void 0 && trace.people.length > 0 ? `｜${trace.people.slice(0, 3).join("、")}` : ""}｜重要 ${trace.importance.toFixed(1)}｜想起 ${trace.recallCount} 次：${trace.text.replace(/\n/gu, " / ").slice(0, 300)}`),
 		timeContext,
 		generate: (system, history, user, options) => generate(system, history, user, options),
 		log: (level, message) => {
@@ -14034,7 +14104,16 @@ ${recentPosts}`
 		contextWindow: getContextWindow
 	});
 	worldRelay = new WorldRelay({
-		getInfo: () => readWorldBridge(root, readSettings(root).worldBridge),
+		getInfo: () => {
+			const bridge = readSettings(root).worldBridge;
+			const privateId = bridge.privateWorldId.trim();
+			if (privateId === "" || privateId === bridge.worldId.trim()) return readWorldBridge(root, bridge);
+			return readWorldBridge(root, {
+				enabled: bridge.enabled,
+				worldId: privateId,
+				worldDir: ""
+			});
+		},
 		deliver: async (text, kind, options) => {
 			const owner = readQqConfig(qqConfigPath(root)).config.ownerQq.trim();
 			if (owner === "") {
@@ -14150,9 +14229,76 @@ ${recentPosts}`
 				}
 			})();
 			const hint = fragmentHint(worldDir);
+			/**
+			
+			* 共用记忆：永久记忆 + 记忆 v3。
+			
+			*
+			
+			* 以前这两份只有群聊读得到，世界私聊完全看不见——同一个她，两个脑子。
+			
+			* 现在把它们也拼进世界提示词，做到「一份存储、两路读取」。
+			
+			* 条数有上限，避免把世界提示词撑爆。
+			
+			*/
+			const sharedMemory = (() => {
+				const out = [];
+				try {
+					const ownerKey = `p:${readQqConfig(qqConfigPath(root)).config.ownerQq}`;
+					const perm = [...permanentList(root, ownerKey, "global"), ...permanentList(root, ownerKey, "session")];
+					if (perm.length > 0) out.push(["【永久记忆（和 QQ 群聊读的同一份，主人指定要记住的）】", ...perm.slice(-20).map((entry) => `- ${entry.text}`)].join("\n"));
+					const store = readMemoryStore(join(root, "memory-v3.json"));
+					const items = listMemories(store, ownerKey).slice().sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0)).slice(0, 10);
+					if (items.length > 0) out.push(["【长期记忆（按重要度取前 10 条，和群聊同一份）】", ...items.map((item) => `- ${item.text}`)].join("\n"));
+				} catch {}
+				return out.join("\n\n");
+			})();
+			/**
+			
+			* 当天日记素材：插件那边记的「每条回复 + 评分理由 + 内心吐槽」。
+			
+			*
+			
+			* 这是给写日记用的原料，不是记忆本身。晚上她自己写日记时读一下，
+			
+			* 把群里的原话、当时的吐槽提炼进当天的世界日记——日记只有世界这一本。
+			
+			*/
+			const diaryMaterial = (() => {
+				try {
+					const file = join(root, "diary.json");
+					if (!existsSync(file)) return "";
+					const parsed = JSON.parse(readFileSync(file, "utf8"));
+					const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+					const startOfDay = new Date();
+					startOfDay.setHours(0, 0, 0, 0);
+					const today$1 = entries.filter((e) => typeof e.at === "number" && e.at >= startOfDay.getTime());
+					if (today$1.length === 0) return "";
+					const lines = today$1.slice(-40).map((e) => {
+						const time = new Date(Number(e.at)).toLocaleTimeString("zh-CN", {
+							timeZone: "Asia/Shanghai",
+							hour12: false
+						});
+						const where = String(e.groupId ?? "").startsWith("p:") ? "私聊" : "群";
+						const reply = String(e.reply ?? e.text ?? "").replace(/\s+/gu, " ").slice(0, 90);
+						const thought = String(e.thought ?? "").replace(/\s+/gu, " ").slice(0, 60);
+						return `- ${time} ${where}｜我：${reply}${thought === "" ? "" : `｜当时想：${thought}`}`;
+					});
+					return [
+						"【今天值得写进日记的素材（QQ 那边记的，不是记忆）】",
+						...lines,
+						"晚上写日记时可以翻一翻，提炼成自己的话；不要照抄。"
+					].join("\n");
+				} catch {
+					return "";
+				}
+			})();
 			const merged = [
 				block,
 				digestTail,
+				sharedMemory,
+				diaryMaterial,
 				hint
 			].filter((part) => part !== "").join("\n\n");
 			syncTracePrompt(join(worldDir, "world-prompt.md"), merged);
@@ -14452,8 +14598,9 @@ ${recentPosts}`
 				if (pending.length < 6) continue;
 				const system = [
 					"你在帮大肥鱼整理「群聊记忆」。只输出 JSON 数组，不要解释。",
-					"每条：{\"text\":\"发生了什么（一句事实）\",\"feeling\":\"当时她心里怎么想、什么感觉（一句话，简练）\",\"importance\":0~1,\"emotion\":0~1}",
+					"每条：{\"text\":\"发生了什么（一句事实，必须写清是谁说的/做的）\",\"people\":[\"相关的人名，用对话里出现的原名\"],\"feeling\":\"当时她心里怎么想、什么感觉（一句话，简练）\",\"importance\":0~1,\"emotion\":0~1}",
 					"feeling 用第一人称，像她自己在心里嘀咕一句；不要客套话、不要复述 text。",
+					"text 里不要用「群友」「有人」「对方」这种泛指——写具体昵称；确实不知道是谁才用泛指。",
 					"只记群友之间真实发生的事：谁在意什么、群里的梗、关系变化、她自己说过的话。",
 					"不要记录刷屏、复读、纯表情、机器人操作；不要编造。没有值得记的就输出 []。最多 5 条。"
 				].join("\n");
@@ -14461,7 +14608,7 @@ ${recentPosts}`
 				for (let batch = 0; batch < 6 && offset < pending.length; batch += 1) {
 					const slice = pending.slice(offset, offset + 30);
 					if (slice.length === 0) break;
-					const lines = slice.map((turn) => `${turn.role === "user" ? "群友" : "大肥鱼"}：${turn.text.slice(0, 200)}`);
+					const lines = slice.map((turn) => `${turn.role === "user" ? turn.name?.trim() || "群友" : "大肥鱼"}：${turn.text.slice(0, 200)}`);
 					const result = await generate(system, [], `这个群最近的对话：\n${lines.join("\n")}\n\n请提取。`, {
 						json: true,
 						maxTokens: 900,
@@ -14481,6 +14628,8 @@ ${recentPosts}`
 						writeTrace(dir, makeTrace({
 							text: item.text,
 							...typeof item.feeling === "string" ? { feeling: item.feeling } : {},
+							...Array.isArray(item.people) ? { people: item.people.filter((p) => typeof p === "string") } : {},
+							happenedAt: slice[slice.length - 1]?.ts,
 							domain: "group",
 							importance: typeof item.importance === "number" ? Math.min(.75, item.importance) : void 0,
 							emotion: typeof item.emotion === "number" ? item.emotion : void 0,
@@ -14822,6 +14971,36 @@ ${recentPosts}`
 					result
 				});
 			}
+			if (rest === "world/list" && method === "GET") {
+				const base = join(dirname(root), "worlds");
+				const items = [];
+				try {
+					for (const entry of readdirSync(base, { withFileTypes: true })) {
+						if (!entry.isDirectory()) continue;
+						let online = false;
+						let note = "";
+						try {
+							const bridgeFile = join(base, entry.name, "bridge.json");
+							if (existsSync(bridgeFile)) {
+								const parsed = JSON.parse(readFileSync(bridgeFile, "utf8"));
+								online = typeof parsed.origin === "string" && parsed.origin !== "";
+							} else note = "这个世界的桥还没启动";
+						} catch {
+							note = "桥信息读不到";
+						}
+						items.push({
+							id: entry.name,
+							online,
+							note
+						});
+					}
+				} catch {}
+				items.sort((a, b) => a.id.localeCompare(b.id));
+				return send(200, {
+					ok: true,
+					worlds: items
+				});
+			}
 			if (rest === "world/model" && method === "GET") {
 				const settings = readSettings(root);
 				const worldDir = readWorldBridge(root, settings.worldBridge).worldDir;
@@ -14929,6 +15108,42 @@ ${recentPosts}`
 				ok: true,
 				traces: rankedTraces()
 			});
+			/**
+			
+			* 批量回填 happenedAt（一次性修数据用）。
+			
+			*
+			
+			* 老痕迹只有 createdAt（写入时刻），注入提示词时没带时间，
+			
+			* 她回忆起来就是一堆「无时间的孤立事实」。这里把 createdAt 复制过去。
+			
+			*/
+			if (rest === "world/traces-catchup" && method === "POST") {
+				const dir = traceStoreDir();
+				if (dir === "") return send(200, {
+					ok: false,
+					message: "世界桥没开或没配目录"
+				});
+				const all = loadTraces(dir);
+				let filled = 0;
+				const next = all.map((trace) => {
+					if (typeof trace.happenedAt === "number" && trace.happenedAt > 0) return trace;
+					if (typeof trace.createdAt !== "number" || trace.createdAt <= 0) return trace;
+					filled += 1;
+					return {
+						...trace,
+						happenedAt: trace.createdAt
+					};
+				});
+				saveTraces(dir, next);
+				syncTraceBlock();
+				return send(200, {
+					ok: true,
+					total: next.length,
+					filled
+				});
+			}
 			if (rest === "world/traces" && method === "POST") {
 				const payload = JSON.parse(body ?? "{}");
 				const action = typeof payload.action === "string" ? payload.action : "";
@@ -15830,7 +16045,7 @@ ${recentPosts}`
 						},
 						sharedTranscript: {
 							enabled: typeof sharedIncoming.enabled === "boolean" ? sharedIncoming.enabled : current.sharedTranscript.enabled,
-							turns: typeof sharedIncoming.turns === "number" ? Math.round(clampNumber(sharedIncoming.turns, 0, 40, current.sharedTranscript.turns)) : current.sharedTranscript.turns,
+							turns: typeof sharedIncoming.turns === "number" ? Math.round(clampNumber(sharedIncoming.turns, 0, 5e3, current.sharedTranscript.turns)) : current.sharedTranscript.turns,
 							revealToGroup: typeof sharedIncoming.revealToGroup === "boolean" ? sharedIncoming.revealToGroup : current.sharedTranscript.revealToGroup
 						},
 						persona: typeof patch.settings.persona === "string" ? patch.settings.persona : current.persona,
@@ -15898,6 +16113,7 @@ ${recentPosts}`
 							return {
 								enabled: typeof incoming.enabled === "boolean" ? incoming.enabled : current.worldBridge.enabled,
 								worldId: typeof incoming.worldId === "string" && incoming.worldId.trim() !== "" ? incoming.worldId.trim().slice(0, 80) : current.worldBridge.worldId,
+								privateWorldId: typeof incoming.privateWorldId === "string" ? incoming.privateWorldId.trim().slice(0, 80) : current.worldBridge.privateWorldId,
 								worldDir: typeof incoming.worldDir === "string" ? incoming.worldDir.trim().slice(0, 500) : current.worldBridge.worldDir,
 								privateBackend: incoming.privateBackend === "world" || incoming.privateBackend === "plugin" || incoming.privateBackend === "chat" ? incoming.privateBackend : current.worldBridge.privateBackend,
 								wakeOnStart: typeof incoming.wakeOnStart === "boolean" ? incoming.wakeOnStart : current.worldBridge.wakeOnStart,

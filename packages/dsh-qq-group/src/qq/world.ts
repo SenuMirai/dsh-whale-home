@@ -11,6 +11,8 @@ export type WorldBridgeInfo = {
   online: boolean;
   name?: string;
   origin?: string;
+  /** 投递路径。老版本的世界没有这个字段，按 /dsh-world/bridge/say 兜底。 */
+  path?: string;
   /** 只给桥接客户端用；/world/status 会去掉 */
   token?: string;
   pid?: number;
@@ -58,12 +60,14 @@ export function readWorldBridge(
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
       origin?: unknown;
+      path?: unknown;
       token?: unknown;
       pid?: unknown;
       startedAt?: unknown;
       name?: unknown;
     };
     const origin = typeof parsed.origin === 'string' ? parsed.origin.trim() : '';
+    const bridgePath = typeof parsed.path === 'string' && parsed.path.startsWith('/') ? parsed.path : undefined;
     const pid = typeof parsed.pid === 'number' ? parsed.pid : 0;
     const name = typeof parsed.name === 'string' ? parsed.name : undefined;
     const startedAt = typeof parsed.startedAt === 'string' ? parsed.startedAt : undefined;
@@ -74,6 +78,7 @@ export function readWorldBridge(
       online: origin !== '' && alive,
       ...(name === undefined ? {} : { name }),
       ...(origin === '' ? {} : { origin }),
+      ...(bridgePath === undefined ? {} : { path: bridgePath }),
       ...(typeof parsed.token === 'string' && parsed.token !== '' ? { token: parsed.token } : {}),
       ...(pid === 0 ? {} : { pid }),
       pidAlive: alive,
@@ -98,7 +103,7 @@ export async function postWorldSay(
     const base64 = Buffer.from(image.data).toString('base64');
     return `data:${image.mediaType};base64,${base64}`;
   });
-  const response = await fetch(`${info.origin}/dsh-world/bridge/say`, {
+  const response = await fetch(`${info.origin}${info.path ?? '/dsh-world/bridge/say'}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
