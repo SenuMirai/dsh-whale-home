@@ -1,0 +1,24 @@
+# ============================================================================
+# dsh-whale-girl —— DSH bundle patch
+# ============================================================================
+# 插件挂载声明：DSH 启动时把本插件插进 profile 的配置树。
+#
+# ⚠️ `name:` 必须与安装后的**包名**完全一致（dsh-whale-girl），否则表现为
+#    「装上了但设置页 404、路由全 404」。
+#
+# ── 这份文件是重建的（2026-10-20）──
+# 项目放在 OneDrive 同步目录里，一次同步事故把 cordis.patch.yml 连同 assets/、
+# docs/、deploy/、LICENSE 一起弄丢了。源码（src/、tools/）完好。
+# 没有这份 patch 时，插件在 profile 里登记着但**完全加载不了**：
+#   /dsh-whale-girl/*  → 404
+#   /plugins/dsh-whale-girl/client.js → 404
+# 重建依据：package.json 的 exports、tools/verify-load.mjs 的期望（`id: dsh-whale-girl`），
+# 以及同目录其它插件（dsh-bili-whale / dsh-workbuddy-quota）的写法。
+#
+# ── 教训：不要再把开发目录放在 OneDrive 下 ──
+# 见 docs/QQ.md 末尾「OneDrive 事故」一节。
+# ============================================================================
+
+- insert:
+    - id: dsh-whale-girl
+      name: dsh-whale-girl
