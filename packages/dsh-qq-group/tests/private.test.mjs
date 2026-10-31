@@ -17,8 +17,8 @@ import {
 } from '../src/qq/config.ts';
 
 // ── 1. 命名空间：私聊 key 与群号绝不会撞 ──
-assert.equal(privateKey('10086'), 'p:10086');
-assert.equal(privateUserId('p:10086'), '10086');
+assert.equal(privateKey('805732070'), 'p:805732070');
+assert.equal(privateUserId('p:805732070'), '805732070');
 assert.equal(privateUserId('809773499'), undefined, '群号不该被认成私聊 key');
 assert.equal(PRIVATE_KEY_PREFIX, 'p:');
 
@@ -42,11 +42,11 @@ assert.equal(dp.voiceChance < base.defaultGroup.voiceChance, true, '私聊语音
 // ── 3. 归一化：privates 与 groups 分别按自己的 key 校验 ──
 const normalized = normalizeConfig({
   groups: { '809773499': { enabled: true } },
-  privates: { '10086': { enabled: true }, '10001': {} },
+  privates: { '805732070': { enabled: true }, '10001': {} },
 });
 assert.equal(Object.keys(normalized.groups).length, 1);
 assert.equal(Object.keys(normalized.privates).length, 2);
-assert.equal(normalized.privates['10086'].enabled, true);
+assert.equal(normalized.privates['805732070'].enabled, true);
 // 没写的字段该继承私聊默认（而不是群聊默认）
 assert.equal(normalized.privates['10001'].proactive.enabled, false);
 assert.equal(normalized.privates['10001'].maxRepliesPer10Min, 0);
@@ -58,13 +58,13 @@ assert.throws(() => normalizeConfig({ privates: { abc: {} } }), /privates\.abc/)
 const cfg = normalizeConfig({
   groups: { '809773499': { enabled: true, name: '群里的大肥鱼' } },
   defaultGroup: { enabled: false },
-  privates: { '10086': { enabled: true, name: '主人私聊' } },
+  privates: { '805732070': { enabled: true, name: '主人私聊' } },
   defaultPrivate: { enabled: false },
 });
 assert.equal(policyFor(cfg, '809773499').name, '群里的大肥鱼');
-assert.equal(privatePolicyFor(cfg, '10086').name, '主人私聊');
+assert.equal(privatePolicyFor(cfg, '805732070').name, '主人私聊');
 // 同一个数字串：当群号查不到私聊那份，当私聊也查不到群那份
-assert.equal(policyFor(cfg, '10086').enabled, false, '群表里没有这个人，应落到 defaultGroup');
+assert.equal(policyFor(cfg, '805732070').enabled, false, '群表里没有这个人，应落到 defaultGroup');
 assert.equal(privatePolicyFor(cfg, '809773499').enabled, false, '私聊表里没有这个号，应落到 defaultPrivate');
 
 // ── 5. 未列出的人：拿到的必须是「关着」的策略 ──

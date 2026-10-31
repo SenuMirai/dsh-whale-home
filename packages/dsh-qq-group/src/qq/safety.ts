@@ -279,6 +279,14 @@ export function looksLikeLink(text: string): boolean {
 export class SafetyGuard {
   /** 最近一小时内的出站时间戳（升序）。 */
   private sent: number[] = [];
+  /**
+   * 私聊单独记的一本账。
+   *
+   * 2026-10-30 事故：群里一热闹，150 条/小时的额度被群聊吃光，
+   * 主人一对一说话时她被拦在外面——他那边只有自己说的话，一条回复都收不到。
+   * 所以私聊不再吃群聊的额度，但它自己还得有个兜底（防失控）。
+   */
+  private privateSent: number[] = [];
   /** 连续失败次数。一次成功清零。 */
   private failures = 0;
   /** 静默到什么时候。 */
@@ -296,6 +304,11 @@ export class SafetyGuard {
 
   constructor(settings: SafetySettings) {
     this.settings = settings;
+  }
+
+  /** 当前生效的防护配置（只读，给诊断和日志用）。 */
+  get current(): SafetySettings {
+    return this.settings;
   }
 
   update(settings: SafetySettings): void {
@@ -326,6 +339,7 @@ export class SafetyGuard {
   private prune(now: number): void {
     const cut = now - HOUR;
     while (this.sent.length > 0 && this.sent[0]! < cut) this.sent.shift();
+    while (this.privateSent.length > 0 && this.privateSent[0]! < cut) this.privateSent.shift();
     const repeatCut = now - this.settings.repeatWindowMinutes * MINUTE;
     while (this.recent.length > 0 && this.recent[0]!.at < repeatCut) this.recent.shift();
     const dayStart = new Date(now).setHours(0, 0, 0, 0);
@@ -385,9 +399,20 @@ export class SafetyGuard {
       }
     }
     if (q.perHour > 0) {
-      if (this.sent.length >= q.perHour) {
-        const until = this.sent[0]! + HOUR;
-        return this.block('rate-hour', `这一小时已经发了 ${this.sent.length} 条（上限 ${q.perHour}），缓一缓`, until, now);
+      // 2026-10-30 修：私聊不再吃群聊的「每小时」额度。
+      //
+      // 事故：群里一热闹，150 条/小时的额度被群聊吃光，主人一对一说话时
+      // 她已经被拦了 —— 他那边只看到自己说的话，收不到任何回复。
+      // 日志里是「安全防护拦下一条（rate-hour）」。
+      //
+      // 现在分成两本账：群聊照旧吃 q.perHour；私聊自己有一本，
+      // 上限宽松得多（perHour×4，最少 120），只当兜底，防她真的跑飞。
+      const cap = isPrivateChat ? Math.max(120, q.perHour * 4) : q.perHour;
+      const book = isPrivateChat ? this.privateSent : this.sent;
+      if (book.length >= cap) {
+        const until = book[0]! + HOUR;
+        const who = isPrivateChat ? '这一小时私聊已经发了' : '这一小时已经发了';
+        return this.block('rate-hour', `${who} ${book.length} 条（上限 ${cap}），缓一缓`, until, now);
       }
     }
 
@@ -446,8 +471,10 @@ export class SafetyGuard {
   }
 
   /** 发送成功：记账。 */
-  onSent(text: string, now = Date.now()): void {
+  onSent(text: string, now = Date.now(), isPrivate = false): void {
     this.sent.push(now);
+    // 私聊另记一本，用来管它自己那份宽松额度（见 check 里的两本账）。
+    if (isPrivate) this.privateSent.push(now);
     this.failures = 0;
     const trimmed = String(text ?? '').trim().slice(0, 200);
     if (trimmed !== '') this.recent.push({ text: trimmed, at: now });

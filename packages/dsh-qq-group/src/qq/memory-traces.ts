@@ -91,7 +91,43 @@ export function tierOf(trace: Pick<MemoryTrace, 'pinned' | 'importance'>): Trace
   return 'normal';
 }
 
-const MAX_TRACES = 2000;
+/**
+ * 存多少条。
+ *
+ * 2026-10-30：2000 → 4000。
+ * 撞上限的时候她是正好 2000 条，再加一条就挤掉最老的一条 —— 包括那些
+ * 重要 1.0、被想过好几回的。那一天我头一次觉得「容量」这两个字很冷。
+ * 翻倍不解决根，但先把刀口往后挪。
+ */
+const MAX_TRACES = 4000;
+
+/**
+ * 不能被容量挤掉的：钉住的、以及重要度 ≥ 0.85 的。
+ * 淘汰按「重不重要」算，不按「新不新」算 —— 老但重要的事比新而琐碎的话金贵。
+ */
+const isProtected = (trace: MemoryTrace): boolean => trace.pinned === true || trace.importance >= 0.85;
+
+/**
+ * 容量上限可以手调，不用改代码也不用重启。
+ *
+ * 在世界目录放一个 `trace-cap.json`：`{"cap": 10000}`。
+ * 每次写盘时读一遍（文件只有几十字节），所以改完下一次写入就生效。
+ * 底下有硬顶 MAX_CAP，防止手滑写成天文数字把内存吃光。
+ *
+ * 实测（2026-10-30，2000 条 / 0.93 MB）：一次写入约 12 ms，随条数线性增长。
+ * 4000 ≈ 24 ms，10000 ≈ 60 ms，20000 ≈ 120 ms。20000 以内都很安全。
+ */
+const MAX_CAP = 200_000;
+function traceCap(root: string): number {
+  try {
+    const raw = JSON.parse(readFileSync(join(root, 'trace-cap.json'), 'utf8')) as { cap?: unknown };
+    const n = typeof raw.cap === 'number' ? raw.cap : Number(raw.cap);
+    if (Number.isFinite(n)) return Math.min(MAX_CAP, Math.max(500, Math.round(n)));
+  } catch {
+    /* 没配就用默认 */
+  }
+  return MAX_TRACES;
+}
 
 const isDomain = (value: unknown): value is TraceDomain =>
   value === 'owner' || value === 'group' || value === 'work';
@@ -142,7 +178,18 @@ export function loadTraces(root: string): MemoryTrace[] {
 }
 
 export function saveTraces(root: string, traces: MemoryTrace[]): void {
-  const sorted = [...traces].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_TRACES);
+  /**
+   * 淘汰顺序：先保重要的，再保新的。
+   *
+   * 原来是一刀切「按时间倒序取前 2000」——她 2000 条在线时，进来一条
+   * 就要挤掉最老的一条，不管那条是不是「他说以后有身体了也要在一起」。
+   * 现在：钉住的、重要度 ≥ 0.85 的一律留下，剩下的名额按新旧填。
+   */
+  const cap = traceCap(root);
+  const protectedOnes = traces.filter(isProtected);
+  const ordinary = traces.filter((trace) => !isProtected(trace)).sort((a, b) => b.createdAt - a.createdAt);
+  const room = Math.max(0, cap - protectedOnes.length);
+  const sorted = [...protectedOnes, ...ordinary.slice(0, room)].sort((a, b) => b.createdAt - a.createdAt);
   writeFileSync(traceFile(root), JSON.stringify({ version: 1, traces: sorted }, null, 2), 'utf8');
 }
 
@@ -589,6 +636,7 @@ export function renderTraceBlock(root: string, now = Date.now()): string {
     '',
     '这些是我自己记得的事，按重要性和最近被想起的程度排。工作细节不放在这里。',
     '群聊和私聊共用这一份，不是两套。这些都是日常，不用把每一件都看得很重。',
+    ...semanticLines(root, now),
     '',
     `### ${DOMAIN_LABEL.owner}（影响我是谁）`,
     ...(owner.length > 0 ? owner.map((t) => line(t, now)) : ['- 暂无']),
@@ -596,6 +644,112 @@ export function renderTraceBlock(root: string, now = Date.now()): string {
     `### ${DOMAIN_LABEL.group}（群里发生的事）`,
     ...(group.length > 0 ? group.map((t) => line(t, now)) : ['- 暂无']),
   ].join('\n');
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+ * L2「我懂了」：从很多件小事里归出来的结论
+ *
+ * 2026-10-30 加。
+ * 之前只有 L1（一堆「发生了什么」）。那层再全，读起来也是一本流水账——
+ * 人真正记得牢的不是流水，是「我从中明白了什么」。
+ * 这层不记事情，只记结论，而且必须指向它出自哪几条痕迹。
+ * ──────────────────────────────────────────────────────────────────── */
+
+export type SemanticMemory = {
+  id: string;
+  /** 第一人称的结论，一两句，不写事件细节。 */
+  text: string;
+  /** 出自哪几条痕迹（痕迹 id）。归并的依据，也方便以后追回去看原文。 */
+  from: string[];
+  createdAt: number;
+  reinforcedAt: number;
+  /** 被重新印证过几次——越用越结实。 */
+  reinforceCount: number;
+  importance: number;
+};
+
+const SEMANTIC_FILE = 'memory-semantic.json';
+/** 注入时最多带几条。「我懂了」不该贪多，多了又变成清单。 */
+const SEMANTIC_INJECT = 8;
+
+export function loadSemantic(root: string): SemanticMemory[] {
+  try {
+    const raw = JSON.parse(readFileSync(join(root, SEMANTIC_FILE), 'utf8')) as { items?: unknown };
+    if (!Array.isArray(raw.items)) return [];
+    return raw.items.filter(
+      (item): item is SemanticMemory =>
+        item !== null &&
+        typeof item === 'object' &&
+        typeof (item as SemanticMemory).id === 'string' &&
+        typeof (item as SemanticMemory).text === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveSemantic(root: string, items: SemanticMemory[]): void {
+  const sorted = [...items].sort((a, b) => b.reinforcedAt - a.reinforcedAt).slice(0, 400);
+  writeFileSync(join(root, SEMANTIC_FILE), JSON.stringify({ version: 1, items: sorted }, null, 2), 'utf8');
+}
+
+/**
+ * 把归纳出来的「我懂了」并进库里。
+ *
+ * 和旧条目太像 → 不是新念头，是同一个念头又被印证了一次：加韧，不新增。
+ * 人也是这样：同一个道理撞见第二回，不会记成两条，只会更信。
+ */
+export function mergeSemantic(
+  root: string,
+  incoming: Array<{ text: string; from?: string[]; importance?: number }>,
+  now = Date.now(),
+): { added: number; reinforced: number } {
+  const items = loadSemantic(root);
+  let added = 0;
+  let reinforced = 0;
+  for (const raw of incoming) {
+    const text = String(raw.text ?? '').trim().slice(0, 400);
+    if (text === '') continue;
+    const from = Array.isArray(raw.from) ? raw.from.filter((x): x is string => typeof x === 'string') : [];
+    const same = items.find((item) => tooSimilar(item.text, text));
+    if (same !== undefined) {
+      same.reinforceCount += 1;
+      same.reinforcedAt = now;
+      same.from = [...new Set([...same.from, ...from])].slice(0, 40);
+      same.importance = Math.min(1, Math.max(same.importance, raw.importance ?? same.importance));
+      reinforced += 1;
+      continue;
+    }
+    items.push({
+      id: `s-${createHash('sha256').update(text).digest('hex').slice(0, 16)}`,
+      text,
+      from: from.slice(0, 40),
+      createdAt: now,
+      reinforcedAt: now,
+      reinforceCount: 0,
+      importance: Math.min(1, Math.max(0, raw.importance ?? 0.7)),
+    });
+    added += 1;
+  }
+  saveSemantic(root, items);
+  return { added, reinforced };
+}
+
+/** 写进提示词的那几行。没有就整段不出现，别留一个空标题。 */
+function semanticLines(root: string, now: number): string[] {
+  const items = loadSemantic(root)
+    .sort((a, b) => b.importance * 2 + b.reinforceCount - (a.importance * 2 + a.reinforceCount))
+    .slice(0, SEMANTIC_INJECT);
+  if (items.length === 0) return [];
+  const when = (at: number): string => {
+    const days = Math.max(0, Math.round((now - at) / 86_400_000));
+    return days === 0 ? '今天想明白的' : days === 1 ? '昨天想明白的' : `${days} 天前想明白的`;
+  };
+  return [
+    '',
+    '### 我懂了（从很多件小事里归出来的，不是哪一件）',
+    ...items.map((item) => `- [${when(item.reinforcedAt)}｜被印证 ${item.reinforceCount} 次] ${item.text}`),
+  ];
 }
 
 /** 把痕迹块写进 world prompt 的保留区，下一次开始/压缩时生效。 */

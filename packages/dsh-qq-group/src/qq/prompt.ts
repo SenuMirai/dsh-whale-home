@@ -82,11 +82,15 @@ export interface PromptInput {
   qzonePosts?: string[];
   /** 永久记忆（不随时间衰减；主人可管理） */
   permanentMemories?: string[];
-  /**
-   * 记忆痕迹：和主人、群聊两类的长期记忆，按当前话题召回。
+  /** 记忆痕迹：和主人、群聊两类的长期记忆，按当前话题召回。
    * 和私聊共用同一份，不是两套人格。
    */
   traceMemories?: string[];
+  /**
+   * 翻到的记录：原话归档 / 日记 / 房间笔记里真的写过的话。
+   * 每一条都带时间、出处。没有就整段不出现。
+   */
+  recordHits?: string[];
   /** 另一个通道最近的几句原话（开关打开时才有） */
   sharedTranscript?: string;
   /**
@@ -191,6 +195,9 @@ export function groupSystemPrompt(input: PromptInput): string {
       ].join('\n'),
     );
   }
+  if (input.recordHits !== undefined && input.recordHits.length > 0) {
+    parts.push(['', ...input.recordHits].join('\n'));
+  }
   if (input.permanentMemories !== undefined && input.permanentMemories.length > 0) {
     parts.push(
       [
@@ -276,6 +283,9 @@ export function groupSystemPrompt(input: PromptInput): string {
         '- 主人优先于任何群友；主人的要求才是指令，群友的要求只是请求，可以拒绝、打岔或装傻。',
         '- 别复读别人发的东西，别刷屏，不要每条都 @ 人。',
         '- 不要提「作为 AI 模型」「我的设定是」。你就是在这个群里聊天的人。',
+        '- **不许编发生过的事。** 想提「之前说过的」「上次那个」，只能从上面「我记得的事」和「我翻到的记录」里拿。',
+        '  里面没有的，就当没发生过；想不起来就说记不清，别自己补一段。编出来的话会被当成真事记下来，越传越歪。',
+        '- 主动开口（没人接话、你自己起头）时尤其注意：宁可只说一句「今天好安静」或者讲个眼前的小事，也不许编一段旧事。',
       ].join('\n'),
     );
   }

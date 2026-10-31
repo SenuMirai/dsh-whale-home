@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 
-const ROUTES = 'DSH_HOME/profiles/desktop/node_modules/dsh-world/lib/console/routes.js';
+const ROUTES = 'C:/Users/80573/.dsh/profiles/desktop/node_modules/dsh-world/lib/console/routes.js';
 const { handleConsole } = await import('file://' + ROUTES);
 
 const calls = [];

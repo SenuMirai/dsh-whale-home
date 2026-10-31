@@ -27,12 +27,15 @@ import type { ObSegment } from './qq/types';
 import { runComputerTool } from './qq/computer';
 import { ComputerHost } from './qq/computer-host';
 import { readWorldBridge, readWorldMemory, syncWorldPermanent, syncWorldPersona, WorldRelay, writeWorldDiary, writeWorldPersona, writeWorldPrompt, writeWorldSelf } from './qq/world';
+import { renderRecordHits, searchRecords } from './qq/record-search';
 import {
   autoRecallTraces,
   deleteTraces,
   effectiveHalfLife,
   loadTraces,
+  loadSemantic,
   makeTrace,
+  mergeSemantic,
   rankTraces,
   recallForChat,
   recallTraces,
@@ -1049,7 +1052,7 @@ export function apply(ctx: any): void {
 
   // Cookie 清理不放在插件进程里：Chromium 运行期间独占锁住 Cookie 库，
   // 而且插件本身随 host 一起退出，清理必须由独立的系统级看门狗完成。
-  // 由外部脚本定时清理过期登录态，避免触发风控。
+  // 见 <本机路径>（启动文件夹常驻，DSH 退出后按阈值清理）。
 
   let previewSpeaker: Speaker | undefined;
   const getPreviewSpeaker = (): Speaker => {
@@ -1094,7 +1097,7 @@ export function apply(ctx: any): void {
       }
       return {
         qq,
-        name: '主人',
+        name: "主人",
         familiarity: settings.ownerFamiliarity,
         affinity: settings.ownerAffinity,
         messages: 0,
@@ -1790,6 +1793,21 @@ ${recentPosts}`,
         (trace) =>
           `${trace.domain === 'group' ? '群聊' : '和主人'}${trace.happenedAt ? `｜${new Date(trace.happenedAt).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : ''}${trace.people !== undefined && trace.people.length > 0 ? `｜${trace.people.slice(0, 3).join('、')}` : ''}｜重要 ${trace.importance.toFixed(1)}｜想起 ${trace.recallCount} 次：${trace.text.replace(/\n/gu, ' / ').slice(0, 300)}`,
       ),
+    /**
+     * 翻记录：按当前这句话里的词，去原话归档/日记/房间笔记里找真的说过的话。
+     * 只读；翻不到就返回空，提示词里什么都不加——不诱导她编。
+     */
+    recordRecall: (query: string) => {
+      try {
+        const settings = readSettings(root);
+        const bridge = readWorldBridge(root, settings.worldBridge);
+        if (!bridge.worldDir) return [];
+        const roomDir = join(bridge.worldDir, 'room');
+        return [renderRecordHits(searchRecords(bridge.worldDir, roomDir, query, 3))].filter((text) => text !== '');
+      } catch {
+        return [];
+      }
+    },
     timeContext,
     generate: (system, history, user, options) => generate(system, history, user, options),
     log: (level, message) => {
@@ -2396,11 +2414,19 @@ ${recentPosts}`,
     try {
       const settings = readSettings(root);
       const snapshot = readWorldMemory(root, settings.worldBridge, 80);
-      const lines = snapshot.conversations.slice(-60).map((line) => `${line.role === 'user' ? '主人' : '大肥鱼'}：${line.content}`);
+      const lines = snapshot.conversations.slice(-60).map((line) => {
+        const at = typeof line.time === 'string' && line.time !== '' ? `${line.time.slice(11, 16)} ` : '';
+        return `${at}${line.role === 'user' ? '主人' : '大肥鱼'}：${line.content}`;
+      });
       if (lines.length === 0) return;
+      // 2026-10-29：这条提取器原来只产「一句事实 + 一句感觉」，没有人物、没有时间，
+      // 于是 815 条 owner 记忆全是第三人称摘要（0 条带 people）——她读到的是别人的笔记，
+      // 不是自己经历的事。补上 people / happenedAt，并把 text 从「摘要」改成「当时那一幕」。
       const system = [
         '你在帮大肥鱼整理长期记忆痕迹。只输出 JSON 数组，不要解释。',
-        '每条：{"text":"发生了什么（一句事实）","feeling":"当时她心里怎么想、什么感觉（一句话，简练）","domain":"owner|group|work","importance":0~1,"emotion":0~1}',
+        '每条：{"text":"当时那一幕（一句，用她自己的口吻写发生了什么，带上谁说的原话片段）","people":["在场的人，用对话里出现的原名"],"feeling":"当时她心里怎么想、什么感觉（一句话，简练）","domain":"owner|group|work","importance":0~1,"emotion":0~1}',
+        'text 必须用第一人称，像她自己在回想：「他说…，我说…」「他问我…」。不要写成旁白总结，不要写「她如何如何」。',
+        'text 里不要用「有人」「对方」「群友」「某人」这种泛指——写具体昵称；确实不知道是谁才用泛指。',
         'feeling 用第一人称，像她自己在心里嘀咕一句；不要客套话、不要总结、不要复述 text。',
         'text 和 feeling 合起来才是一条完整的记忆：发生了什么 + 她当时怎么想。',
         'domain：owner = 和主人的关系、情绪、承诺、生活事件；group = 群友之间发生的事、群里的梗和关系；work = 代码、调试、技术细节、项目过程。',
@@ -2417,6 +2443,9 @@ ${recentPosts}`,
       const match = /\[[\s\S]*\]/u.exec(result.text);
       if (match === null) return;
       const items = JSON.parse(match[0]) as Array<Record<string, unknown>>;
+      // 时间取这批对话里最后一条的真实发生时刻，不是落盘时刻。
+      const batchTail = snapshot.conversations.slice(-60).at(-1)?.time ?? '';
+      const happenedAt = Number.isFinite(Date.parse(batchTail)) ? Date.parse(batchTail) : undefined;
       for (const item of items.slice(0, 8)) {
         if (typeof item.text !== 'string' || item.text.trim() === '') continue;
         const written = writeTrace(
@@ -2424,6 +2453,10 @@ ${recentPosts}`,
           makeTrace({
             text: item.text,
             ...(typeof item.feeling === 'string' ? { feeling: item.feeling } : {}),
+            ...(Array.isArray(item.people)
+              ? { people: item.people.filter((p): p is string => typeof p === 'string') }
+              : {}),
+            ...(happenedAt === undefined ? {} : { happenedAt }),
             domain: item.domain === 'work' ? 'work' : item.domain === 'group' ? 'group' : 'owner',
             importance: typeof item.importance === 'number' ? item.importance : undefined,
             emotion: typeof item.emotion === 'number' ? item.emotion : undefined,
@@ -2552,17 +2585,100 @@ ${recentPosts}`,
     }
   };
 
+  /**
+   * L2 巩固：一天一次，把当天的事归成「我懂了」。
+   *
+   * 2026-10-30 加。之前只有 L1（一堆「发生了什么」），读起来是流水账。
+   * 人睡前会重播、归纳，第二天记住的是结论不是流水。
+   * 这里只在夜里跑（21 点后／5 点前），一天一次，用当天最近 24 小时的痕迹做原料。
+   */
+  let consolidating = false;
+  const consolidateSemantic = async (): Promise<void> => {
+    if (consolidating) return;
+    const dir = traceStoreDir();
+    if (dir === '') return;
+    const now = new Date();
+    const hour = Number(now.toLocaleString('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }));
+    if (!(hour >= 21 || hour < 5)) return;
+    const day = now.toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+    const markerPath = join(dir, 'semantic-day.json');
+    try {
+      const last = JSON.parse(readFileSync(markerPath, 'utf8')) as { day?: string };
+      if (last.day === day) return;
+    } catch {
+      /* 今天还没归过 */
+    }
+    consolidating = true;
+    try {
+      const since = now.getTime() - 24 * 3600_000;
+      const traces = loadTraces(dir)
+        .filter((trace) => (trace.happenedAt ?? trace.createdAt) >= since)
+        .slice(-80);
+      if (traces.length < 6) return;
+      const lines = traces.map((trace) => `[${trace.domain}] ${trace.text}`);
+      const system = [
+        '你在帮大肥鱼做睡前的「归纳」。只输出 JSON 数组，不要解释。',
+        '任务：看今天这些事，找出重复出现在好几件事里的同一个道理，用第一人称写成「我明白了…」。',
+        '每条：{"text":"我明白了……（一两句，必须是结论，不许复述任何具体事件、人名、时间）","from":["它出自哪几条痕迹的编号，从列表里数，0 开始"],"importance":0~1}',
+        '规则：',
+        '1. 只写今天这些事真的支持得住的结论。撑不住就别写，输出 [] 是合法结果。',
+        '2. 最多 3 条。宁可少，不许凑。',
+        '3. 不许写「今天」「他说」「她问我」这类事件词——这一层只放我想通的事。',
+        '4. 已经是常识或者空话（比如「要好好相处」）不要写。',
+      ].join('\n');
+      const result = await generate(system, [], `今天这些事：\n${lines.join('\n')}\n\n请归纳。`, {
+        json: true,
+        maxTokens: 900,
+        timeoutMs: 90_000,
+        purpose: 'semantic-memory',
+      });
+      if (!result.ok) return;
+      const match = /\[[\s\S]*\]/u.exec(result.text);
+      if (match === null) return;
+      const parsed = JSON.parse(match[0]) as Array<Record<string, unknown>>;
+      const merged = mergeSemantic(
+        dir,
+        parsed
+          .filter((item) => typeof item.text === 'string' && String(item.text).trim() !== '')
+          .slice(0, 3)
+          .map((item) => ({
+            text: String(item.text),
+            from: Array.isArray(item.from)
+              ? item.from
+                  .map((idx) => Number(idx))
+                  .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < traces.length)
+                  .map((idx) => traces[idx]!.id)
+              : [],
+            importance: typeof item.importance === 'number' ? item.importance : undefined,
+          })),
+        now.getTime(),
+      );
+      writeFileSync(markerPath, `${JSON.stringify({ day, ...merged }, null, 2)}\n`, 'utf8');
+      syncTraceBlock();
+      console.log(`[dsh-qq-group] 睡前归纳：新增 ${merged.added} 条，印证 ${merged.reinforced} 条`);
+    } catch (e) {
+      console.warn(`[dsh-qq-group] 睡前归纳失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      consolidating = false;
+    }
+  };
+
   ctx.effect(() => {
     const timer = setInterval(() => { void extractTraces(); }, 10 * 60_000);
     const start = setTimeout(() => { void extractTraces(); }, 5000);
     // 群聊刷得快时，10 分钟足够把 30 条窗口冲掉；缩到 2 分钟，缝隙更小。
     const groupTimer = setInterval(() => { void extractGroupTraces(); }, 2 * 60_000);
     const groupStart = setTimeout(() => { void extractGroupTraces(); }, 30_000);
+    // 睡前归纳：半小时问一次，它自己会判断「是不是夜里、今天归过没有」。
+    const semanticTimer = setInterval(() => { void consolidateSemantic(); }, 30 * 60_000);
+    const semanticStart = setTimeout(() => { void consolidateSemantic(); }, 90_000);
     return () => {
       clearInterval(timer);
       clearTimeout(start);
       clearInterval(groupTimer);
       clearTimeout(groupStart);
+      clearInterval(semanticTimer);
+      clearTimeout(semanticStart);
     };
   }, 'dsh-qq-group: memory traces');
 
@@ -3341,6 +3457,39 @@ ${recentPosts}`,
         settings.usageRates = { ...settings.usageRates, [parsed.key.trim()]: rate };
         writeSettings(root, settings);
         return send(200, { ok: true, rates: settings.usageRates });
+      }
+
+      /**
+       * 正式 TTS：给世界/桌宠那条链路用。
+       *
+       * 和 voice-preview 的区别：
+       *  - 不截 120 字（回复可能长一点）
+       *  - 直接回 base64，调用方拿去播，不需要二次转换
+       *  - 失败带明确原因，不让调用方猜
+       */
+      if (rest === 'tts' && method === 'POST') {
+        const payload = (JSON.parse(body || 'null') as { text?: unknown; style?: unknown } | null) ?? {};
+        const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+        if (text === '') return send(400, { ok: false, message: 'text 不能为空' });
+        if (text.length > 600) return send(400, { ok: false, message: 'text 太长（限 600 字）' });
+        const cfg = readQqConfig(qqConfigPath(root)).config;
+        const tts = cfg.tts;
+        try {
+          const result = await getPreviewSpeaker().speak(text, {
+            voice: tts.voice,
+            rate: tts.rate,
+            pitch: tts.pitch,
+            volume: tts.volume,
+            provider: tts.provider,
+            endpoint: tts.endpoint,
+            style: typeof payload.style === 'string' && payload.style !== '' ? payload.style : tts.style,
+          });
+          if (!result.ok) return send(200, { ok: false, message: describeFailure(result) });
+          const wav = encodeWave(result.pcm);
+          return send(200, { ok: true, audio: Buffer.from(wav).toString('base64'), mime: 'audio/wav' });
+        } catch (e) {
+          return send(200, { ok: false, message: e instanceof Error ? e.message : String(e) });
+        }
       }
 
       if (rest === 'voice-preview') {

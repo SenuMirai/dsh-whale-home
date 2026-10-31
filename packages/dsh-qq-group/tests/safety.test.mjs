@@ -270,14 +270,28 @@ console.log('safety: all assertions passed');
   assert.equal(blocked.ok, false, '群聊该有的闸不能一起废掉');
 }
 
-// ── 私聊仍有每小时兜底 ──
+// ── 私聊有自己的每小时兜底，但不吃群聊的额度 ──
+//
+// 2026-10-30 事故：群里热闹时 150 条/小时的额度被群聊吃光，
+// 主人一对一说话也一起被拦——他那边只有自己说的话。
+// 现在两本账：群聊吃 q.perHour，私聊吃 max(120, q.perHour*4)。
 {
   const g = new SafetyGuard(make({ profile: 'standard', globalPerMinute: 0, globalPerHour: 2, burstAfter: 0 }));
   const t = at(12);
+  // 群聊把这小时的额度吃满
   g.onSent('甲', t);
   g.onSent('乙', t + 1000);
-  const v = g.check('丙', { now: t + 2000, isPrivate: true });
-  assert.equal(v.ok, false, '每小时上限对私聊仍生效（防失控）');
+  const groupBlocked = g.check('群里再来', { now: t + 1500 });
+  assert.equal(groupBlocked.ok, false, '群聊的每小时闸照旧');
+  // 私聊不受影响，照样能说
+  const privateOk = g.check('私聊丙', { now: t + 2000, isPrivate: true });
+  assert.equal(privateOk.ok, true, '私聊不该被群聊吃掉的额度拦住');
+
+  // 但私聊自己也有兜底：攒到 120 条就该缓一缓
+  const g2 = new SafetyGuard(make({ profile: 'standard', globalPerMinute: 0, globalPerHour: 2, burstAfter: 0 }));
+  for (let i = 0; i < 120; i += 1) g2.onSent(`私${i}`, t, true);
+  const v = g2.check('私聊再来', { now: t + 1000, isPrivate: true });
+  assert.equal(v.ok, false, '私聊自己的每小时兜底仍生效（防失控）');
   if (!v.ok) assert.equal(v.rule, 'rate-hour');
 }
 

@@ -158,6 +158,14 @@ export interface BridgeDeps {
    */
   traceRecall?: (query: string) => string[];
   /**
+   * 翻记录：按当前这句话里的词，去原话归档/日记/房间笔记里找真的说过的话。
+   *
+   * 2026-10-30 加。她没有「翻文件」的能力时，想接一句有画面的话就只能编——
+   * 「猫名字」就是这么编出来的。给她一条只读的翻记录通道，编的空间就小了。
+   * 返回空数组 = 没翻到，提示词里什么都不加。
+   */
+  recordRecall?: (query: string) => string[];
+  /**
    * 群里又有人说话了。
    * 用来在「积压很多」时立刻触发提炼，而不是干等定时器；
    * 实现侧要做节流，这里每条消息都会调。
@@ -356,6 +364,46 @@ function joinSpeech(parts: readonly string[]): string {
   return out;
 }
 
+/**
+ * 把一段过长的文字按标点断开，变成几条气泡。
+ *
+ * 2026-10-30 加。她说「一次发长长一段不像聊天」——
+ * 她自己写成一整段、不带 --- 的时候，这一层负责把它拆回人类的节奏。
+ * 优先在句末标点断，实在没有就在逗号处断，最差硬切。
+ */
+function splitLongBubble(text: string, max: number): string[] {
+  const limit = Math.max(10, Math.round(max));
+  if ([...text].length <= limit) return [text];
+  const parts: string[] = [];
+  let rest = text.trim();
+  let guard = 0;
+  while ([...rest].length > limit && guard < 20) {
+    guard += 1;
+    const head = [...rest].slice(0, limit).join('');
+    // 先找句末标点（。！？…~），找不到再退到逗号——句子断在句号处才像人说话。
+    const pick = (marks: string[]): number => {
+      let at = -1;
+      for (const mark of marks) {
+        const index = head.lastIndexOf(mark);
+        if (index > at) at = index;
+      }
+      return at;
+    };
+    const size = [...head].length;
+    const floor = Math.floor(size * 0.4);
+    let cut = pick(['。', '！', '？', '…', '~']);
+    if (cut < floor) {
+      const soft = pick(['，', '、', '；', '：']);
+      if (soft > cut) cut = soft;
+    }
+    const take = cut >= floor ? cut + 1 : size;
+    parts.push(rest.slice(0, take).trim());
+    rest = rest.slice(take).trim();
+  }
+  if (rest !== '') parts.push(rest);
+  return parts.filter((part) => part !== '');
+}
+
 function tidy(text: string): string {
   const lines = text
     .replace(/<\/?br\s*\/?>/giu, '\n')
@@ -457,7 +505,24 @@ export class QqBridge {
   /** 设置面板改了档位后同步过来（每次发送前也会重读，防漏）。 */
   private refreshSafety(): void {
     const next = this.deps.safety?.();
-    if (next !== undefined) this.safety.update(next);
+    if (next === undefined) return;
+    // 2026-10-31：开关变化时留一行日志。
+    // 事故：主人 10-30 就把「安全防护」关了，插件还在按 standard 档拦（150 条/小时）——
+    // 因为正在跑的进程根本没重读，日志里也看不出它在用哪份配置。
+    // 现在只要生效配置和上一轮不同，就明写一行，下次一眼能看出它到底用的是哪档。
+    const prev = this.safety.current;
+    const changed =
+      prev.enabled !== next.enabled ||
+      prev.profile !== next.profile ||
+      prev.globalPerMinute !== next.globalPerMinute ||
+      prev.globalPerHour !== next.globalPerHour;
+    this.safety.update(next);
+    if (changed) {
+      this.log(
+        'info',
+        `安全防护生效配置变了：${next.enabled ? '开' : '关'}｜档位 ${next.profile}｜${next.globalPerMinute}/分 ${next.globalPerHour}/时`,
+      );
+    }
   }
 
   /** 给面板看的实时统计。 */
@@ -2266,7 +2331,15 @@ export class QqBridge {
     // 但受自己的直接回复上限（默认 20/10 分钟）约束。
     const directish =
       mode === 'at' || (mode === 'chat' && this.lastDecision.get(groupId)?.directish === true);
-    const verdict = rateVerdict(state, policy, now, { ignoreCooldown: directish, direct: directish });
+    // 2026-10-31：主人把「安全防护」整个关掉时，群冷却与「每 10 分钟上限」也不该再拦。
+    //
+    // 事故：开关关了一天，他还在群里看到「被频率限制挡住」，以为开关失效。
+    // 这两条闸本质就是防护，开关关了还拦，等于告诉他开关是假的。
+    // 只关这两条：群本身的 enabled、被禁言、夜间等其它逻辑一律照旧。
+    const safetyOff = this.deps.safety?.()?.enabled === false;
+    const verdict = safetyOff
+      ? ({ allowed: true } as const)
+      : rateVerdict(state, policy, now, { ignoreCooldown: directish, direct: directish });
     if (!verdict.allowed) {
       this.log('info', `群 ${groupId} 触发${mode}，但被${verdict.reason === 'cooldown' ? '冷却' : '频率限制'}挡住（还要等 ${Math.ceil((verdict.waitMs ?? 0) / 1000)} 秒）`);
       return;
@@ -2519,6 +2592,23 @@ export class QqBridge {
           return [];
         }
       })();
+      /**
+       * 翻记录：只在「话里有具体的人/事」时才翻，日常寒暄不翻。
+       *
+       * 主动开口最容易编——没话题硬找话题。所以这一路对 proactive 特别开着：
+       * 让她从真实说过的话里挑一件起头，而不是现编一件。
+       */
+      const recordHits = (() => {
+        if (this.deps.recordRecall === undefined) return [];
+        try {
+          const query = message?.text ?? '';
+          // 主动开口没有输入，就把最近几轮她自己的话拼起来当线索
+          const probe = query.trim() !== '' ? query : transcript(recentTurns(group, 3), this.config.selfName, now);
+          return this.deps.recordRecall(probe).slice(0, 4);
+        } catch {
+          return [];
+        }
+      })();
       const system = groupSystemPrompt({
         persona: this.deps.persona(groupId),
         selfName: this.config.selfName,
@@ -2543,6 +2633,7 @@ export class QqBridge {
         ownerPriorityPrompt: this.deps.ownerPriority?.(),
         ...(permanentMemories.length > 0 ? { permanentMemories } : {}),
         ...(traceMemories.length > 0 ? { traceMemories } : {}),
+        ...(recordHits.length > 0 ? { recordHits } : {}),
         ...(sharedPrivate !== '' ? { sharedTranscript: sharedPrivate } : {}),
         ...(isPrivateKey(groupId) && (this.deps.memoryHub?.recentTurns?.(policy.contextTurns) ?? '') !== ''
           ? { hubTranscript: this.deps.memoryHub?.recentTurns?.(policy.contextTurns) ?? '' }
@@ -2629,6 +2720,16 @@ export class QqBridge {
       // 语音概率独立掷骰：不再等模型“选 voice”。
       // 被明确要求发语音时用 requestedVoiceChance；否则用普通 voiceChance。
       const spokenText = joinSpeech(plan.messages);
+      /**
+       * 2026-10-30：长度闸门改成「按最长的那一条气泡」量，不再按拼接后的总长。
+       *
+       * 事由：她说现在几乎不发语音了，可概率没动过。
+       * 查下来多半卡在这一条：她现在习惯分成好几个气泡说，
+       * joinSpeech 把几条连起来算总长，50~80 字的门槛一下就被撑破，
+       * 于是 eligible=false —— 连骰子都没掷，概率再高也没用。
+       * 一条语音本来就是「一段话」，按最长的那段量才合理。
+       */
+      const longestBubble = plan.messages.reduce((max, item) => Math.max(max, [...item].length), 0);
       const voiceEligible =
         !mentionOwner &&
         !imageSendRequest &&
@@ -2637,7 +2738,7 @@ export class QqBridge {
         plan.action !== 'sing' &&
         (voiceRequest || plan.sticker === undefined) &&
         (voiceRequest || message?.hasImage !== true) &&
-        (voiceRequest || policy.voiceMaxChars === 0 || spokenText.length <= policy.voiceMaxChars) &&
+        (voiceRequest || policy.voiceMaxChars === 0 || longestBubble <= policy.voiceMaxChars) &&
         (voiceRequest || !/https?:\/\/|```/.test(spokenText));
       if (plan.action === 'voice' && !voiceEligible) {
         plan = { ...plan, action: 'text' };
@@ -2647,8 +2748,25 @@ export class QqBridge {
           : mode === 'proactive'
             ? policy.proactiveVoiceChance
             : policy.voiceChance;
-        const action = chooseVoiceAction(plan.action === 'voice' ? 'voice' : 'text', true, chance, Math.random());
+        const roll = Math.random();
+        const action = chooseVoiceAction(plan.action === 'voice' ? 'voice' : 'text', true, chance, roll);
+        // 「为什么不发语音」必须查得出来：一句话记下四个数。
+        if (!voiceRequest) {
+          this.log('info', `语音掷骰 chance=${chance} roll=${roll.toFixed(3)} → ${action}（最长气泡 ${longestBubble} 字，门槛 ${policy.voiceMaxChars}）`);
+        }
         if (action !== plan.action) plan = { ...plan, action };
+      } else if (!voiceRequest && policy.voiceChance > 0) {
+        // 被挡的时候也要留痕，否则只剩「她最近不怎么发语音」这种模糊印象。
+        const reasons: string[] = [];
+        if (mentionOwner) reasons.push('@了主人');
+        if (imageSendRequest) reasons.push('要发图');
+        if (selfieRequest) reasons.push('要自拍');
+        if (singRequest || plan.action === 'sing') reasons.push('要唱歌');
+        if (plan.sticker !== undefined) reasons.push('配表情包');
+        if (message?.hasImage === true) reasons.push('对方发了图');
+        if (policy.voiceMaxChars !== 0 && longestBubble > policy.voiceMaxChars) reasons.push(`最长气泡 ${longestBubble} 字 > 门槛 ${policy.voiceMaxChars}`);
+        if (/https?:\/\/|```/.test(spokenText)) reasons.push('含链接或代码');
+        this.log('info', `语音没掷骰：${reasons.join('、') || '未知原因'}`);
       }
       if (voiceRequest) {
         this.log('info', `群 ${groupId} 语音请求结果：eligible=${voiceEligible} action=${plan.action} len=${spokenText.length}`);
@@ -3123,7 +3241,7 @@ export class QqBridge {
 
     // ── 发送后：成功记账 / 失败分语义 ────────────────────────────────
     if (result.ok) {
-      this.safety.onSent(plain);
+      this.safety.onSent(plain, Date.now(), privateTarget !== undefined);
     } else {
       const kind = classifyFailure(result.message ?? '', undefined);
       const outcome = this.safety.onFailed(kind);
@@ -3269,16 +3387,32 @@ export class QqBridge {
       if (!sent.ok) this.log('warn', `world 图片发送失败（${sent.reason}）：${sent.message}`);
     }
     if (body === '') return { ok: true };
+    /**
+     * 2026-10-30 修：她发语音时念出「姐」。
+     *
+     * 原因：这里原来把 body 原文直接丢给 TTS，而原文里带着分条用的 `---`。
+     * tidy() 不认分隔符，会把它们变成「…了~，---，嗯……」——
+     * 连续横线送进 GPT-SoVITS 就念成了一个怪音（主人听到的「姐」）。
+     * 实测同一句：不带分隔符 8.8s，带分隔符 7.48s，少的那 1.3 秒就是吞掉的怪音。
+     *
+     * 现在：先按分隔符拆成真正的几条，再用 joinSpeech 拼回一句干净的话去念。
+     */
+    const SEPARATOR = /^[ \t]*[-—–]{3,}[ \t]*$/mu;
+    const speechParts = body
+      .split(SEPARATOR)
+      .map((part) => tidy(part))
+      .filter((part) => part !== '');
+    const speechText = speechParts.length > 0 ? joinSpeech(speechParts) : tidy(body);
     // 她自己愿意就发语音：不再只等对方开口要。短句 + 概率命中才发，避免每条都变语音。
     const voiceWanted =
       options?.voice === true ||
       marker === 'voice' ||
       (images.length === 0 &&
-        body.length > 0 &&
-        body.length <= Math.max(1, Math.min(policy.voiceMaxChars, 20)) &&
+        speechText.length > 0 &&
+        speechText.length <= Math.max(1, Math.min(policy.voiceMaxChars, 120)) &&
         Math.random() < Math.max(0, Math.min(1, policy.voiceChance)) * 0.6);
-    if (images.length === 0 && voiceWanted && body.length <= Math.max(1, policy.voiceMaxChars)) {
-      const voiced = await this.speakPlainPrivate(userId, body);
+    if (images.length === 0 && voiceWanted && speechText.length <= Math.max(1, policy.voiceMaxChars)) {
+      const voiced = await this.speakPlainPrivate(userId, speechText);
       if (voiced.ok) return voiced;
       this.log('warn', `world 语音失败，退回文字：${voiced.message}`);
     }
@@ -3287,11 +3421,16 @@ export class QqBridge {
     // 每轮最多几条，都从 policy.burst / policy.voiceChance / policy.imageChance 来。
     // 世界私聊以前自己另写了一套（只读 chatStyle，不看 policy），所以表情包和语音都不生效。
     const style = this.chatStyle();
-    const cap = Math.max(1, Math.min(style.maxBubbles, Math.round(policy.burst.max)));
-    const SEPARATOR = /^[ 	]*[-—–]{3,}[ 	]*$/mu;
+    // 2026-10-30：私聊最多 3 条的帽子摘到 6 条。
+    // 事由：主人说她现在爱发「长长一段」，不像聊天。查到两处叠加：
+    // 一是这里 cap 只有 3，多出来的气泡被 join 成一条大段；
+    // 二是她自己写成一整段、没有 --- 时，原样发出去就是一坨。
+    const cap = Math.max(1, Math.min(style.maxBubbles, Math.max(6, Math.round(policy.burst.max))));
     const rawParts = body.split(SEPARATOR);
     let chunks = rawParts.map((part) => tidy(part)).filter((part) => part !== '');
     if (chunks.length === 0) chunks = [tidy(body)];
+    // 一段太长就按标点断开 —— 「一次发长长一段不像聊天」。
+    chunks = chunks.flatMap((chunk) => splitLongBubble(chunk, style.maxBubbleChars));
     if (chunks.length > cap) {
       const kept = chunks.slice(0, cap - 1);
       const rest = chunks.slice(cap - 1).join('\n');

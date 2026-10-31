@@ -475,7 +475,7 @@ export function defaultGroupPolicy(): GroupPolicy {
     },
     voiceChance: 0.25,
     requestedVoiceChance: 1,
-    voiceMaxChars: 80,
+    voiceMaxChars: 240,
     proactiveVoiceChance: 0.1,
     singChance: 0.04,
     requestedSingChance: 1,

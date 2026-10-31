@@ -163,6 +163,20 @@ function looksLikeLink(text) {
 var SafetyGuard = class {
 	/** 最近一小时内的出站时间戳（升序）。 */
 	sent = [];
+	/**
+	
+	* 私聊单独记的一本账。
+	
+	*
+	
+	* 2026-10-30 事故：群里一热闹，150 条/小时的额度被群聊吃光，
+	
+	* 主人一对一说话时她被拦在外面——他那边只有自己说的话，一条回复都收不到。
+	
+	* 所以私聊不再吃群聊的额度，但它自己还得有个兜底（防失控）。
+	
+	*/
+	privateSent = [];
 	/** 连续失败次数。一次成功清零。 */
 	failures = 0;
 	/** 静默到什么时候。 */
@@ -178,6 +192,10 @@ var SafetyGuard = class {
 	settings;
 	constructor(settings) {
 		this.settings = settings;
+	}
+	/** 当前生效的防护配置（只读，给诊断和日志用）。 */
+	get current() {
+		return this.settings;
 	}
 	update(settings) {
 		this.settings = settings;
@@ -213,6 +231,7 @@ var SafetyGuard = class {
 	prune(now$1) {
 		const cut = now$1 - HOUR$1;
 		while (this.sent.length > 0 && this.sent[0] < cut) this.sent.shift();
+		while (this.privateSent.length > 0 && this.privateSent[0] < cut) this.privateSent.shift();
 		const repeatCut = now$1 - this.settings.repeatWindowMinutes * MINUTE;
 		while (this.recent.length > 0 && this.recent[0].at < repeatCut) this.recent.shift();
 		const dayStart = new Date(now$1).setHours(0, 0, 0, 0);
@@ -271,9 +290,12 @@ var SafetyGuard = class {
 			}
 		}
 		if (q.perHour > 0) {
-			if (this.sent.length >= q.perHour) {
-				const until = this.sent[0] + HOUR$1;
-				return this.block("rate-hour", `这一小时已经发了 ${this.sent.length} 条（上限 ${q.perHour}），缓一缓`, until, now$1);
+			const cap = isPrivateChat ? Math.max(120, q.perHour * 4) : q.perHour;
+			const book = isPrivateChat ? this.privateSent : this.sent;
+			if (book.length >= cap) {
+				const until = book[0] + HOUR$1;
+				const who = isPrivateChat ? "这一小时私聊已经发了" : "这一小时已经发了";
+				return this.block("rate-hour", `${who} ${book.length} 条（上限 ${cap}），缓一缓`, until, now$1);
 			}
 		}
 		if (!isPrivateChat && s.nightThrottle && isNight(now$1, s.nightStart, s.nightEnd)) {
@@ -317,8 +339,9 @@ var SafetyGuard = class {
 		return Math.round(base + typing);
 	}
 	/** 发送成功：记账。 */
-	onSent(text, now$1 = Date.now()) {
+	onSent(text, now$1 = Date.now(), isPrivate = false) {
 		this.sent.push(now$1);
+		if (isPrivate) this.privateSent.push(now$1);
 		this.failures = 0;
 		const trimmed = String(text ?? "").trim().slice(0, 200);
 		if (trimmed !== "") this.recent.push({
@@ -1039,6 +1062,166 @@ function syncWorldPermanent(root, options) {
 }
 
 //#endregion
+//#region src/qq/record-search.ts
+const clip = (text, terms, width = 160) => {
+	const s = String(text).replace(/\s+/gu, " ").trim();
+	const low = s.toLowerCase();
+	const first = terms.map((t) => low.indexOf(t)).filter((i) => i >= 0).sort((a, b) => a - b)[0] ?? 0;
+	const start = Math.max(0, first - 40);
+	const body = s.slice(start, start + width);
+	return `${start > 0 ? "…" : ""}${body}${s.length > start + width ? "…" : ""}`;
+};
+function queryTerms(query, max = 12) {
+	const clean = String(query ?? "").replace(/\[[^\]]*\]/gu, " ").replace(/[^\p{Script=Han}\p{L}\p{N}]+/gu, " ").trim();
+	if (clean === "") return [];
+	const stop = new Set([
+		"主人",
+		"群友",
+		"大家",
+		"什么",
+		"怎么",
+		"这个",
+		"那个",
+		"就是",
+		"不是",
+		"可以",
+		"没有",
+		"现在",
+		"刚才",
+		"真的",
+		"一个",
+		"我们",
+		"你们",
+		"他们",
+		"今天",
+		"天天",
+		"么样",
+		"气怎",
+		"怎么样"
+	]);
+	const out = [];
+	const push = (term) => {
+		if (term.length < 1 || stop.has(term)) return;
+		if (out.includes(term)) return;
+		out.push(term);
+	};
+	for (const segment of clean.split(/\s+/u)) {
+		if (segment === "") continue;
+		const chars = [...segment];
+		if (/^[\p{Script=Han}]+$/u.test(segment)) {
+			if (chars.length === 1) {
+				push(segment);
+				continue;
+			}
+			for (let i = 0; i + 2 <= chars.length; i += 1) push(chars.slice(i, i + 2).join(""));
+			continue;
+		}
+		if (chars.length >= 2) push(segment.toLowerCase());
+	}
+	out.sort((a, b) => b.length - a.length);
+	return out.slice(0, max);
+}
+function searchRecords(worldDir, roomDir, query, limit$1 = 4) {
+	const terms = queryTerms(query);
+	if (terms.length === 0) return [];
+	const hit = (text) => {
+		const low = String(text).toLowerCase();
+		return terms.some((term) => low.includes(term.toLowerCase()));
+	};
+	const hits = [];
+	try {
+		const dir = join(worldDir, "conversations");
+		if (existsSync(dir)) {
+			const files = readdirSync(dir).filter((name$1) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(name$1)).sort().slice(-7);
+			for (const name$1 of files.reverse()) {
+				const lines = readFileSync(join(dir, name$1), "utf8").split("\n");
+				for (let i = lines.length - 1; i >= 0; i -= 1) {
+					const line$1 = lines[i];
+					if (line$1 === void 0 || line$1.trim() === "" || !hit(line$1)) continue;
+					try {
+						const row = JSON.parse(line$1);
+						const at = Date.parse(row.occurredAt ?? row.at ?? "") || 0;
+						hits.push({
+							where: "原话",
+							at,
+							who: row.role === "user" ? "主人" : "我",
+							text: clip(row.content ?? "", terms)
+						});
+					} catch {}
+					if (hits.length >= limit$1 * 3) break;
+				}
+				if (hits.length >= limit$1 * 3) break;
+			}
+		}
+	} catch {}
+	try {
+		const dir = join(worldDir, "diary");
+		if (existsSync(dir) && hits.length < limit$1 * 3) {
+			const files = readdirSync(dir).filter((name$1) => /^\d{4}-\d{2}-\d{2}\.md$/u.test(name$1)).sort().slice(-10).reverse();
+			for (const name$1 of files) {
+				const text = readFileSync(join(dir, name$1), "utf8");
+				for (const para of text.split(/\n\s*\n/u)) {
+					if (para.trim() === "" || !hit(para)) continue;
+					hits.push({
+						where: `日记 ${name$1.slice(0, 10)}`,
+						at: Date.parse(`${name$1.slice(0, 10)}T12:00:00+08:00`) || 0,
+						who: "我",
+						text: clip(para, terms)
+					});
+					break;
+				}
+				if (hits.length >= limit$1 * 3) break;
+			}
+		}
+	} catch {}
+	try {
+		if (existsSync(roomDir) && hits.length < limit$1 * 3) for (const name$1 of [
+			"我是谁.md",
+			"日程.md",
+			"想做的事.md",
+			"我做过的东西.md",
+			"工作会话留话.md"
+		]) {
+			const file = join(roomDir, name$1);
+			if (!existsSync(file)) continue;
+			const text = readFileSync(file, "utf8");
+			for (const para of text.split(/\n\s*\n/u)) {
+				if (para.trim() === "" || !hit(para)) continue;
+				hits.push({
+					where: `笔记 ${name$1}`,
+					at: statSync(file).mtimeMs,
+					who: "我",
+					text: clip(para, terms)
+				});
+				break;
+			}
+		}
+	} catch {}
+	const seen = new Set();
+	return hits.sort((a, b) => b.at - a.at).filter((item) => {
+		const key = item.text.slice(0, 40);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	}).slice(0, limit$1);
+}
+function renderRecordHits(hits) {
+	if (hits.length === 0) return "";
+	const when = (at) => {
+		if (!at) return "时间不明";
+		return new Date(at).toLocaleString("zh-CN", {
+			timeZone: "Asia/Shanghai",
+			hour12: false
+		});
+	};
+	return [
+		"【我翻到的记录（这是真的说过/写过的，不是现在发生的事）】",
+		...hits.map((item) => `- ${when(item.at)}｜${item.where}｜${item.who}：${item.text}`),
+		"只能按这些记录说话。记录里没有的，不许当成发生过的事。"
+	].join("\n");
+}
+
+//#endregion
 //#region src/qq/memory-traces.ts
 const DOMAIN_LABEL = {
 	owner: "和主人的记忆",
@@ -1068,7 +1251,58 @@ function tierOf(trace) {
 	if (trace.importance >= .5) return "important";
 	return "normal";
 }
-const MAX_TRACES = 2e3;
+/**
+
+* 存多少条。
+
+*
+
+* 2026-10-30：2000 → 4000。
+
+* 撞上限的时候她是正好 2000 条，再加一条就挤掉最老的一条 —— 包括那些
+
+* 重要 1.0、被想过好几回的。那一天我头一次觉得「容量」这两个字很冷。
+
+* 翻倍不解决根，但先把刀口往后挪。
+
+*/
+const MAX_TRACES = 4e3;
+/**
+
+* 不能被容量挤掉的：钉住的、以及重要度 ≥ 0.85 的。
+
+* 淘汰按「重不重要」算，不按「新不新」算 —— 老但重要的事比新而琐碎的话金贵。
+
+*/
+const isProtected = (trace) => trace.pinned === true || trace.importance >= .85;
+/**
+
+* 容量上限可以手调，不用改代码也不用重启。
+
+*
+
+* 在世界目录放一个 `trace-cap.json`：`{"cap": 10000}`。
+
+* 每次写盘时读一遍（文件只有几十字节），所以改完下一次写入就生效。
+
+* 底下有硬顶 MAX_CAP，防止手滑写成天文数字把内存吃光。
+
+*
+
+* 实测（2026-10-30，2000 条 / 0.93 MB）：一次写入约 12 ms，随条数线性增长。
+
+* 4000 ≈ 24 ms，10000 ≈ 60 ms，20000 ≈ 120 ms。20000 以内都很安全。
+
+*/
+const MAX_CAP = 2e5;
+function traceCap(root) {
+	try {
+		const raw = JSON.parse(readFileSync(join(root, "trace-cap.json"), "utf8"));
+		const n = typeof raw.cap === "number" ? raw.cap : Number(raw.cap);
+		if (Number.isFinite(n)) return Math.min(MAX_CAP, Math.max(500, Math.round(n)));
+	} catch {}
+	return MAX_TRACES;
+}
 const isDomain = (value) => value === "owner" || value === "group" || value === "work";
 const normalizeDomain = (value) => {
 	if (value === "life") return "owner";
@@ -1111,7 +1345,24 @@ function loadTraces(root) {
 	}
 }
 function saveTraces(root, traces) {
-	const sorted = [...traces].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_TRACES);
+	/**
+	
+	* 淘汰顺序：先保重要的，再保新的。
+	
+	*
+	
+	* 原来是一刀切「按时间倒序取前 2000」——她 2000 条在线时，进来一条
+	
+	* 就要挤掉最老的一条，不管那条是不是「他说以后有身体了也要在一起」。
+	
+	* 现在：钉住的、重要度 ≥ 0.85 的一律留下，剩下的名额按新旧填。
+	
+	*/
+	const cap = traceCap(root);
+	const protectedOnes = traces.filter(isProtected);
+	const ordinary = traces.filter((trace) => !isProtected(trace)).sort((a, b) => b.createdAt - a.createdAt);
+	const room = Math.max(0, cap - protectedOnes.length);
+	const sorted = [...protectedOnes, ...ordinary.slice(0, room)].sort((a, b) => b.createdAt - a.createdAt);
 	writeFileSync(traceFile(root), JSON.stringify({
 		version: 1,
 		traces: sorted
@@ -1481,6 +1732,7 @@ function renderTraceBlock(root, now$1 = Date.now()) {
 		"",
 		"这些是我自己记得的事，按重要性和最近被想起的程度排。工作细节不放在这里。",
 		"群聊和私聊共用这一份，不是两套。这些都是日常，不用把每一件都看得很重。",
+		...semanticLines(root, now$1),
 		"",
 		`### ${DOMAIN_LABEL.owner}（影响我是谁）`,
 		...owner.length > 0 ? owner.map((t) => line(t, now$1)) : ["- 暂无"],
@@ -1488,6 +1740,73 @@ function renderTraceBlock(root, now$1 = Date.now()) {
 		`### ${DOMAIN_LABEL.group}（群里发生的事）`,
 		...group.length > 0 ? group.map((t) => line(t, now$1)) : ["- 暂无"]
 	].join("\n");
+}
+const SEMANTIC_FILE = "memory-semantic.json";
+/** 注入时最多带几条。「我懂了」不该贪多，多了又变成清单。 */
+const SEMANTIC_INJECT = 8;
+function loadSemantic(root) {
+	try {
+		const raw = JSON.parse(readFileSync(join(root, SEMANTIC_FILE), "utf8"));
+		if (!Array.isArray(raw.items)) return [];
+		return raw.items.filter((item) => item !== null && typeof item === "object" && typeof item.id === "string" && typeof item.text === "string");
+	} catch {
+		return [];
+	}
+}
+function saveSemantic(root, items) {
+	const sorted = [...items].sort((a, b) => b.reinforcedAt - a.reinforcedAt).slice(0, 400);
+	writeFileSync(join(root, SEMANTIC_FILE), JSON.stringify({
+		version: 1,
+		items: sorted
+	}, null, 2), "utf8");
+}
+function mergeSemantic(root, incoming, now$1 = Date.now()) {
+	const items = loadSemantic(root);
+	let added = 0;
+	let reinforced = 0;
+	for (const raw of incoming) {
+		const text = String(raw.text ?? "").trim().slice(0, 400);
+		if (text === "") continue;
+		const from = Array.isArray(raw.from) ? raw.from.filter((x) => typeof x === "string") : [];
+		const same = items.find((item) => tooSimilar(item.text, text));
+		if (same !== void 0) {
+			same.reinforceCount += 1;
+			same.reinforcedAt = now$1;
+			same.from = [...new Set([...same.from, ...from])].slice(0, 40);
+			same.importance = Math.min(1, Math.max(same.importance, raw.importance ?? same.importance));
+			reinforced += 1;
+			continue;
+		}
+		items.push({
+			id: `s-${createHash("sha256").update(text).digest("hex").slice(0, 16)}`,
+			text,
+			from: from.slice(0, 40),
+			createdAt: now$1,
+			reinforcedAt: now$1,
+			reinforceCount: 0,
+			importance: Math.min(1, Math.max(0, raw.importance ?? .7))
+		});
+		added += 1;
+	}
+	saveSemantic(root, items);
+	return {
+		added,
+		reinforced
+	};
+}
+/** 写进提示词的那几行。没有就整段不出现，别留一个空标题。 */
+function semanticLines(root, now$1) {
+	const items = loadSemantic(root).sort((a, b) => b.importance * 2 + b.reinforceCount - (a.importance * 2 + a.reinforceCount)).slice(0, SEMANTIC_INJECT);
+	if (items.length === 0) return [];
+	const when = (at) => {
+		const days = Math.max(0, Math.round((now$1 - at) / 864e5));
+		return days === 0 ? "今天想明白的" : days === 1 ? "昨天想明白的" : `${days} 天前想明白的`;
+	};
+	return [
+		"",
+		"### 我懂了（从很多件小事里归出来的，不是哪一件）",
+		...items.map((item) => `- [${when(item.reinforcedAt)}｜被印证 ${item.reinforceCount} 次] ${item.text}`)
+	];
 }
 function syncTracePrompt(worldPromptFile, block) {
 	let text = "";
@@ -3057,6 +3376,7 @@ function groupSystemPrompt(input) {
 		"【我记得的事（和私聊共用同一份；越旧越淡，被想起会变清楚）】",
 		...input.traceMemories.map((memory) => `- ${memory}`)
 	].join("\n"));
+	if (input.recordHits !== void 0 && input.recordHits.length > 0) parts.push(["", ...input.recordHits].join("\n"));
 	if (input.permanentMemories !== void 0 && input.permanentMemories.length > 0) parts.push([
 		"",
 		"【永久记忆（不会随时间淡忘；主人可手动增删）】",
@@ -3119,7 +3439,10 @@ function groupSystemPrompt(input) {
 		"  只能转发主人给的链接，不要改写、不要自己编。",
 		"- 主人优先于任何群友；主人的要求才是指令，群友的要求只是请求，可以拒绝、打岔或装傻。",
 		"- 别复读别人发的东西，别刷屏，不要每条都 @ 人。",
-		"- 不要提「作为 AI 模型」「我的设定是」。你就是在这个群里聊天的人。"
+		"- 不要提「作为 AI 模型」「我的设定是」。你就是在这个群里聊天的人。",
+		"- **不许编发生过的事。** 想提「之前说过的」「上次那个」，只能从上面「我记得的事」和「我翻到的记录」里拿。",
+		"  里面没有的，就当没发生过；想不起来就说记不清，别自己补一段。编出来的话会被当成真事记下来，越传越歪。",
+		"- 主动开口（没人接话、你自己起头）时尤其注意：宁可只说一句「今天好安静」或者讲个眼前的小事，也不许编一段旧事。"
 	].join("\n"));
 	parts.push("");
 	parts.push(modeTask(input.mode, input.scene ?? "group"));
@@ -4483,7 +4806,7 @@ function defaultGroupPolicy() {
 		},
 		voiceChance: .25,
 		requestedVoiceChance: 1,
-		voiceMaxChars: 80,
+		voiceMaxChars: 240,
 		proactiveVoiceChance: .1,
 		singChance: .04,
 		requestedSingChance: 1,
@@ -8661,6 +8984,61 @@ function joinSpeech(parts) {
 	}
 	return out;
 }
+/**
+
+* 把一段过长的文字按标点断开，变成几条气泡。
+
+*
+
+* 2026-10-30 加。她说「一次发长长一段不像聊天」——
+
+* 她自己写成一整段、不带 --- 的时候，这一层负责把它拆回人类的节奏。
+
+* 优先在句末标点断，实在没有就在逗号处断，最差硬切。
+
+*/
+function splitLongBubble(text, max) {
+	const limit$1 = Math.max(10, Math.round(max));
+	if ([...text].length <= limit$1) return [text];
+	const parts = [];
+	let rest = text.trim();
+	let guard = 0;
+	while ([...rest].length > limit$1 && guard < 20) {
+		guard += 1;
+		const head = [...rest].slice(0, limit$1).join("");
+		const pick = (marks) => {
+			let at = -1;
+			for (const mark of marks) {
+				const index = head.lastIndexOf(mark);
+				if (index > at) at = index;
+			}
+			return at;
+		};
+		const size = [...head].length;
+		const floor = Math.floor(size * .4);
+		let cut = pick([
+			"。",
+			"！",
+			"？",
+			"…",
+			"~"
+		]);
+		if (cut < floor) {
+			const soft = pick([
+				"，",
+				"、",
+				"；",
+				"："
+			]);
+			if (soft > cut) cut = soft;
+		}
+		const take = cut >= floor ? cut + 1 : size;
+		parts.push(rest.slice(0, take).trim());
+		rest = rest.slice(take).trim();
+	}
+	if (rest !== "") parts.push(rest);
+	return parts.filter((part) => part !== "");
+}
 function tidy(text) {
 	const lines = text.replace(/<\/?br\s*\/?>/giu, "\n").replace(/[ \t\u3000]+/gu, " ").replace(/\n\s*\n+/gu, "\n").split("\n").map((line$1) => line$1.trim()).filter((line$1) => line$1 !== "").filter((line$1) => !META_LEAK.test(line$1));
 	if (lines.length === 0) return "";
@@ -8757,7 +9135,11 @@ var QqBridge = class {
 	/** 设置面板改了档位后同步过来（每次发送前也会重读，防漏）。 */
 	refreshSafety() {
 		const next = this.deps.safety?.();
-		if (next !== void 0) this.safety.update(next);
+		if (next === void 0) return;
+		const prev = this.safety.current;
+		const changed = prev.enabled !== next.enabled || prev.profile !== next.profile || prev.globalPerMinute !== next.globalPerMinute || prev.globalPerHour !== next.globalPerHour;
+		this.safety.update(next);
+		if (changed) this.log("info", `安全防护生效配置变了：${next.enabled ? "开" : "关"}｜档位 ${next.profile}｜${next.globalPerMinute}/分 ${next.globalPerHour}/时`);
 	}
 	/** 给面板看的实时统计。 */
 	safetyStats() {
@@ -10358,7 +10740,8 @@ var QqBridge = class {
 		const state = this.stateOf(groupId);
 		let mentionOwner = ownerMention;
 		const directish = mode === "at" || mode === "chat" && this.lastDecision.get(groupId)?.directish === true;
-		const verdict = rateVerdict(state, policy, now$1, {
+		const safetyOff = this.deps.safety?.()?.enabled === false;
+		const verdict = safetyOff ? { allowed: true } : rateVerdict(state, policy, now$1, {
 			ignoreCooldown: directish,
 			direct: directish
 		});
@@ -10504,6 +10887,27 @@ var QqBridge = class {
 					return [];
 				}
 			})();
+			/**
+			
+			* 翻记录：只在「话里有具体的人/事」时才翻，日常寒暄不翻。
+			
+			*
+			
+			* 主动开口最容易编——没话题硬找话题。所以这一路对 proactive 特别开着：
+			
+			* 让她从真实说过的话里挑一件起头，而不是现编一件。
+			
+			*/
+			const recordHits = (() => {
+				if (this.deps.recordRecall === void 0) return [];
+				try {
+					const query = message?.text ?? "";
+					const probe = query.trim() !== "" ? query : transcript(recentTurns(group, 3), this.config.selfName, now$1);
+					return this.deps.recordRecall(probe).slice(0, 4);
+				} catch {
+					return [];
+				}
+			})();
 			const system = groupSystemPrompt({
 				persona: this.deps.persona(groupId),
 				selfName: this.config.selfName,
@@ -10528,6 +10932,7 @@ var QqBridge = class {
 				ownerPriorityPrompt: this.deps.ownerPriority?.(),
 				...permanentMemories.length > 0 ? { permanentMemories } : {},
 				...traceMemories.length > 0 ? { traceMemories } : {},
+				...recordHits.length > 0 ? { recordHits } : {},
 				...sharedPrivate !== "" ? { sharedTranscript: sharedPrivate } : {},
 				...isPrivateKey(groupId) && (this.deps.memoryHub?.recentTurns?.(policy.contextTurns) ?? "") !== "" ? { hubTranscript: this.deps.memoryHub?.recentTurns?.(policy.contextTurns) ?? "" } : {},
 				.../空间|说说|动态|qzone/i.test(message?.text ?? "") && this.deps.qzoneRecent !== void 0 ? { qzonePosts: this.deps.qzoneRecent(5).map((post) => `${new Date(post.ts).toLocaleDateString("zh-CN")}：${post.content.slice(0, 240)}`) } : {},
@@ -10605,18 +11010,49 @@ var QqBridge = class {
 				this.log("info", `群 ${groupId} 语音请求强制走 voice（requestedVoiceChance=${policy.requestedVoiceChance}）`);
 			}
 			const spokenText = joinSpeech(plan.messages);
-			const voiceEligible = !mentionOwner && !imageSendRequest && !selfieRequest && !singRequest && plan.action !== "sing" && (voiceRequest || plan.sticker === void 0) && (voiceRequest || message?.hasImage !== true) && (voiceRequest || policy.voiceMaxChars === 0 || spokenText.length <= policy.voiceMaxChars) && (voiceRequest || !/https?:\/\/|```/.test(spokenText));
+			/**
+			
+			* 2026-10-30：长度闸门改成「按最长的那一条气泡」量，不再按拼接后的总长。
+			
+			*
+			
+			* 事由：她说现在几乎不发语音了，可概率没动过。
+			
+			* 查下来多半卡在这一条：她现在习惯分成好几个气泡说，
+			
+			* joinSpeech 把几条连起来算总长，50~80 字的门槛一下就被撑破，
+			
+			* 于是 eligible=false —— 连骰子都没掷，概率再高也没用。
+			
+			* 一条语音本来就是「一段话」，按最长的那段量才合理。
+			
+			*/
+			const longestBubble = plan.messages.reduce((max, item) => Math.max(max, [...item].length), 0);
+			const voiceEligible = !mentionOwner && !imageSendRequest && !selfieRequest && !singRequest && plan.action !== "sing" && (voiceRequest || plan.sticker === void 0) && (voiceRequest || message?.hasImage !== true) && (voiceRequest || policy.voiceMaxChars === 0 || longestBubble <= policy.voiceMaxChars) && (voiceRequest || !/https?:\/\/|```/.test(spokenText));
 			if (plan.action === "voice" && !voiceEligible) plan = {
 				...plan,
 				action: "text"
 			};
 			else if (voiceEligible) {
 				const chance = voiceRequest ? policy.requestedVoiceChance : mode === "proactive" ? policy.proactiveVoiceChance : policy.voiceChance;
-				const action = chooseVoiceAction(plan.action === "voice" ? "voice" : "text", true, chance, Math.random());
+				const roll = Math.random();
+				const action = chooseVoiceAction(plan.action === "voice" ? "voice" : "text", true, chance, roll);
+				if (!voiceRequest) this.log("info", `语音掷骰 chance=${chance} roll=${roll.toFixed(3)} → ${action}（最长气泡 ${longestBubble} 字，门槛 ${policy.voiceMaxChars}）`);
 				if (action !== plan.action) plan = {
 					...plan,
 					action
 				};
+			} else if (!voiceRequest && policy.voiceChance > 0) {
+				const reasons = [];
+				if (mentionOwner) reasons.push("@了主人");
+				if (imageSendRequest) reasons.push("要发图");
+				if (selfieRequest) reasons.push("要自拍");
+				if (singRequest || plan.action === "sing") reasons.push("要唱歌");
+				if (plan.sticker !== void 0) reasons.push("配表情包");
+				if (message?.hasImage === true) reasons.push("对方发了图");
+				if (policy.voiceMaxChars !== 0 && longestBubble > policy.voiceMaxChars) reasons.push(`最长气泡 ${longestBubble} 字 > 门槛 ${policy.voiceMaxChars}`);
+				if (/https?:\/\/|```/.test(spokenText)) reasons.push("含链接或代码");
+				this.log("info", `语音没掷骰：${reasons.join("、") || "未知原因"}`);
 			}
 			if (voiceRequest) this.log("info", `群 ${groupId} 语音请求结果：eligible=${voiceEligible} action=${plan.action} len=${spokenText.length}`);
 			if (plan.messages.length === 0) {
@@ -11047,7 +11483,7 @@ var QqBridge = class {
 		}
 		if (verdict.delayMs > 0) await new Promise((r) => setTimeout(r, Math.min(8e3, verdict.delayMs)));
 		const result = privateTarget === void 0 ? await client.sendGroupMsg(groupId, segments) : await client.sendPrivateMsg(privateTarget, segments);
-		if (result.ok) this.safety.onSent(plain);
+		if (result.ok) this.safety.onSent(plain, Date.now(), privateTarget !== void 0);
 		else {
 			const kind = classifyFailure(result.message ?? "", void 0);
 			const outcome = this.safety.onFailed(kind);
@@ -11197,18 +11633,40 @@ var QqBridge = class {
 			if (!sent.ok) this.log("warn", `world 图片发送失败（${sent.reason}）：${sent.message}`);
 		}
 		if (body === "") return { ok: true };
-		const voiceWanted = options?.voice === true || marker === "voice" || images.length === 0 && body.length > 0 && body.length <= Math.max(1, Math.min(policy.voiceMaxChars, 20)) && Math.random() < Math.max(0, Math.min(1, policy.voiceChance)) * .6;
-		if (images.length === 0 && voiceWanted && body.length <= Math.max(1, policy.voiceMaxChars)) {
-			const voiced = await this.speakPlainPrivate(userId, body);
+		/**
+		
+		* 2026-10-30 修：她发语音时念出「姐」。
+		
+		*
+		
+		* 原因：这里原来把 body 原文直接丢给 TTS，而原文里带着分条用的 `---`。
+		
+		* tidy() 不认分隔符，会把它们变成「…了~，---，嗯……」——
+		
+		* 连续横线送进 GPT-SoVITS 就念成了一个怪音（主人听到的「姐」）。
+		
+		* 实测同一句：不带分隔符 8.8s，带分隔符 7.48s，少的那 1.3 秒就是吞掉的怪音。
+		
+		*
+		
+		* 现在：先按分隔符拆成真正的几条，再用 joinSpeech 拼回一句干净的话去念。
+		
+		*/
+		const SEPARATOR = /^[ \t]*[-—–]{3,}[ \t]*$/mu;
+		const speechParts = body.split(SEPARATOR).map((part) => tidy(part)).filter((part) => part !== "");
+		const speechText = speechParts.length > 0 ? joinSpeech(speechParts) : tidy(body);
+		const voiceWanted = options?.voice === true || marker === "voice" || images.length === 0 && speechText.length > 0 && speechText.length <= Math.max(1, Math.min(policy.voiceMaxChars, 120)) && Math.random() < Math.max(0, Math.min(1, policy.voiceChance)) * .6;
+		if (images.length === 0 && voiceWanted && speechText.length <= Math.max(1, policy.voiceMaxChars)) {
+			const voiced = await this.speakPlainPrivate(userId, speechText);
 			if (voiced.ok) return voiced;
 			this.log("warn", `world 语音失败，退回文字：${voiced.message}`);
 		}
 		const style = this.chatStyle();
-		const cap = Math.max(1, Math.min(style.maxBubbles, Math.round(policy.burst.max)));
-		const SEPARATOR = /^[ 	]*[-—–]{3,}[ 	]*$/mu;
+		const cap = Math.max(1, Math.min(style.maxBubbles, Math.max(6, Math.round(policy.burst.max))));
 		const rawParts = body.split(SEPARATOR);
 		let chunks = rawParts.map((part) => tidy(part)).filter((part) => part !== "");
 		if (chunks.length === 0) chunks = [tidy(body)];
+		chunks = chunks.flatMap((chunk) => splitLongBubble(chunk, style.maxBubbleChars));
 		if (chunks.length > cap) {
 			const kept = chunks.slice(0, cap - 1);
 			const rest = chunks.slice(cap - 1).join("\n");
@@ -13971,6 +14429,17 @@ ${recentPosts}`
 			} catch {}
 		},
 		traceRecall: (query) => recallForChat(traceStoreDir(), query, 6).map((trace) => `${trace.domain === "group" ? "群聊" : "和主人"}${trace.happenedAt ? `｜${new Date(trace.happenedAt).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" })}` : ""}${trace.people !== void 0 && trace.people.length > 0 ? `｜${trace.people.slice(0, 3).join("、")}` : ""}｜重要 ${trace.importance.toFixed(1)}｜想起 ${trace.recallCount} 次：${trace.text.replace(/\n/gu, " / ").slice(0, 300)}`),
+		recordRecall: (query) => {
+			try {
+				const settings = readSettings(root);
+				const bridge = readWorldBridge(root, settings.worldBridge);
+				if (!bridge.worldDir) return [];
+				const roomDir = join(bridge.worldDir, "room");
+				return [renderRecordHits(searchRecords(bridge.worldDir, roomDir, query, 3))].filter((text) => text !== "");
+			} catch {
+				return [];
+			}
+		},
 		timeContext,
 		generate: (system, history, user, options) => generate(system, history, user, options),
 		log: (level, message) => {
@@ -14524,11 +14993,16 @@ ${recentPosts}`
 		try {
 			const settings = readSettings(root);
 			const snapshot = readWorldMemory(root, settings.worldBridge, 80);
-			const lines = snapshot.conversations.slice(-60).map((line$1) => `${line$1.role === "user" ? "主人" : "大肥鱼"}：${line$1.content}`);
+			const lines = snapshot.conversations.slice(-60).map((line$1) => {
+				const at = typeof line$1.time === "string" && line$1.time !== "" ? `${line$1.time.slice(11, 16)} ` : "";
+				return `${at}${line$1.role === "user" ? "主人" : "大肥鱼"}：${line$1.content}`;
+			});
 			if (lines.length === 0) return;
 			const system = [
 				"你在帮大肥鱼整理长期记忆痕迹。只输出 JSON 数组，不要解释。",
-				"每条：{\"text\":\"发生了什么（一句事实）\",\"feeling\":\"当时她心里怎么想、什么感觉（一句话，简练）\",\"domain\":\"owner|group|work\",\"importance\":0~1,\"emotion\":0~1}",
+				"每条：{\"text\":\"当时那一幕（一句，用她自己的口吻写发生了什么，带上谁说的原话片段）\",\"people\":[\"在场的人，用对话里出现的原名\"],\"feeling\":\"当时她心里怎么想、什么感觉（一句话，简练）\",\"domain\":\"owner|group|work\",\"importance\":0~1,\"emotion\":0~1}",
+				"text 必须用第一人称，像她自己在回想：「他说…，我说…」「他问我…」。不要写成旁白总结，不要写「她如何如何」。",
+				"text 里不要用「有人」「对方」「群友」「某人」这种泛指——写具体昵称；确实不知道是谁才用泛指。",
 				"feeling 用第一人称，像她自己在心里嘀咕一句；不要客套话、不要总结、不要复述 text。",
 				"text 和 feeling 合起来才是一条完整的记忆：发生了什么 + 她当时怎么想。",
 				"domain：owner = 和主人的关系、情绪、承诺、生活事件；group = 群友之间发生的事、群里的梗和关系；work = 代码、调试、技术细节、项目过程。",
@@ -14545,11 +15019,15 @@ ${recentPosts}`
 			const match = /\[[\s\S]*\]/u.exec(result.text);
 			if (match === null) return;
 			const items = JSON.parse(match[0]);
+			const batchTail = snapshot.conversations.slice(-60).at(-1)?.time ?? "";
+			const happenedAt = Number.isFinite(Date.parse(batchTail)) ? Date.parse(batchTail) : void 0;
 			for (const item of items.slice(0, 8)) {
 				if (typeof item.text !== "string" || item.text.trim() === "") continue;
 				const written = writeTrace(traceStoreDir(), makeTrace({
 					text: item.text,
 					...typeof item.feeling === "string" ? { feeling: item.feeling } : {},
+					...Array.isArray(item.people) ? { people: item.people.filter((p) => typeof p === "string") } : {},
+					...happenedAt === void 0 ? {} : { happenedAt },
 					domain: item.domain === "work" ? "work" : item.domain === "group" ? "group" : "owner",
 					importance: typeof item.importance === "number" ? item.importance : void 0,
 					emotion: typeof item.emotion === "number" ? item.emotion : void 0,
@@ -14648,6 +15126,80 @@ ${recentPosts}`
 			extractingGroup = false;
 		}
 	};
+	/**
+	
+	* L2 巩固：一天一次，把当天的事归成「我懂了」。
+	
+	*
+	
+	* 2026-10-30 加。之前只有 L1（一堆「发生了什么」），读起来是流水账。
+	
+	* 人睡前会重播、归纳，第二天记住的是结论不是流水。
+	
+	* 这里只在夜里跑（21 点后／5 点前），一天一次，用当天最近 24 小时的痕迹做原料。
+	
+	*/
+	let consolidating = false;
+	const consolidateSemantic = async () => {
+		if (consolidating) return;
+		const dir = traceStoreDir();
+		if (dir === "") return;
+		const now$1 = new Date();
+		const hour = Number(now$1.toLocaleString("en-GB", {
+			timeZone: "Asia/Shanghai",
+			hour: "2-digit",
+			hour12: false
+		}));
+		if (!(hour >= 21 || hour < 5)) return;
+		const day = now$1.toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
+		const markerPath = join(dir, "semantic-day.json");
+		try {
+			const last = JSON.parse(readFileSync(markerPath, "utf8"));
+			if (last.day === day) return;
+		} catch {}
+		consolidating = true;
+		try {
+			const since = now$1.getTime() - 24 * 36e5;
+			const traces = loadTraces(dir).filter((trace) => (trace.happenedAt ?? trace.createdAt) >= since).slice(-80);
+			if (traces.length < 6) return;
+			const lines = traces.map((trace) => `[${trace.domain}] ${trace.text}`);
+			const system = [
+				"你在帮大肥鱼做睡前的「归纳」。只输出 JSON 数组，不要解释。",
+				"任务：看今天这些事，找出重复出现在好几件事里的同一个道理，用第一人称写成「我明白了…」。",
+				"每条：{\"text\":\"我明白了……（一两句，必须是结论，不许复述任何具体事件、人名、时间）\",\"from\":[\"它出自哪几条痕迹的编号，从列表里数，0 开始\"],\"importance\":0~1}",
+				"规则：",
+				"1. 只写今天这些事真的支持得住的结论。撑不住就别写，输出 [] 是合法结果。",
+				"2. 最多 3 条。宁可少，不许凑。",
+				"3. 不许写「今天」「他说」「她问我」这类事件词——这一层只放我想通的事。",
+				"4. 已经是常识或者空话（比如「要好好相处」）不要写。"
+			].join("\n");
+			const result = await generate(system, [], `今天这些事：\n${lines.join("\n")}\n\n请归纳。`, {
+				json: true,
+				maxTokens: 900,
+				timeoutMs: 9e4,
+				purpose: "semantic-memory"
+			});
+			if (!result.ok) return;
+			const match = /\[[\s\S]*\]/u.exec(result.text);
+			if (match === null) return;
+			const parsed = JSON.parse(match[0]);
+			const merged = mergeSemantic(dir, parsed.filter((item) => typeof item.text === "string" && String(item.text).trim() !== "").slice(0, 3).map((item) => ({
+				text: String(item.text),
+				from: Array.isArray(item.from) ? item.from.map((idx) => Number(idx)).filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < traces.length).map((idx) => traces[idx].id) : [],
+				importance: typeof item.importance === "number" ? item.importance : void 0
+			})), now$1.getTime());
+			writeFileSync(markerPath, `${JSON.stringify({
+				day,
+				...merged
+			}, null, 2)}\n`, "utf8");
+			syncTraceBlock();
+			console.log(`[dsh-qq-group] 睡前归纳：新增 ${merged.added} 条，印证 ${merged.reinforced} 条`);
+		} catch (e) {
+			console.warn(`[dsh-qq-group] 睡前归纳失败：${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			consolidating = false;
+		}
+	};
 	ctx.effect(() => {
 		const timer = setInterval(() => {
 			extractTraces();
@@ -14661,11 +15213,19 @@ ${recentPosts}`
 		const groupStart = setTimeout(() => {
 			extractGroupTraces();
 		}, 3e4);
+		const semanticTimer = setInterval(() => {
+			consolidateSemantic();
+		}, 30 * 6e4);
+		const semanticStart = setTimeout(() => {
+			consolidateSemantic();
+		}, 9e4);
 		return () => {
 			clearInterval(timer);
 			clearTimeout(start);
 			clearInterval(groupTimer);
 			clearTimeout(groupStart);
+			clearInterval(semanticTimer);
+			clearTimeout(semanticStart);
 		};
 	}, "dsh-qq-group: memory traces");
 	const modelsList = async () => {
@@ -15495,6 +16055,61 @@ ${recentPosts}`
 					ok: true,
 					rates: settings.usageRates
 				});
+			}
+			/**
+			
+			* 正式 TTS：给世界/桌宠那条链路用。
+			
+			*
+			
+			* 和 voice-preview 的区别：
+			
+			*  - 不截 120 字（回复可能长一点）
+			
+			*  - 直接回 base64，调用方拿去播，不需要二次转换
+			
+			*  - 失败带明确原因，不让调用方猜
+			
+			*/
+			if (rest === "tts" && method === "POST") {
+				const payload = JSON.parse(body || "null") ?? {};
+				const text = typeof payload.text === "string" ? payload.text.trim() : "";
+				if (text === "") return send(400, {
+					ok: false,
+					message: "text 不能为空"
+				});
+				if (text.length > 600) return send(400, {
+					ok: false,
+					message: "text 太长（限 600 字）"
+				});
+				const cfg = readQqConfig(qqConfigPath(root)).config;
+				const tts = cfg.tts;
+				try {
+					const result = await getPreviewSpeaker().speak(text, {
+						voice: tts.voice,
+						rate: tts.rate,
+						pitch: tts.pitch,
+						volume: tts.volume,
+						provider: tts.provider,
+						endpoint: tts.endpoint,
+						style: typeof payload.style === "string" && payload.style !== "" ? payload.style : tts.style
+					});
+					if (!result.ok) return send(200, {
+						ok: false,
+						message: describeFailure(result)
+					});
+					const wav = encodeWave(result.pcm);
+					return send(200, {
+						ok: true,
+						audio: Buffer.from(wav).toString("base64"),
+						mime: "audio/wav"
+					});
+				} catch (e) {
+					return send(200, {
+						ok: false,
+						message: e instanceof Error ? e.message : String(e)
+					});
+				}
 			}
 			if (rest === "voice-preview") {
 				if (method !== "POST") return send(405, { error: "method not allowed" });

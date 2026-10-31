@@ -12,7 +12,7 @@ import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
-const WORLD = 'DSH_HOME/profiles/desktop/node_modules/dsh-world/lib/persona.js';
+const WORLD = 'C:/Users/80573/.dsh/profiles/desktop/node_modules/dsh-world/lib/persona.js';
 const mod = await import('file://' + WORLD);
 const { readPersonaText, writePersonaText, readPersona, writePersona, renderPersona, PERSONA_LAYERS } = mod;
 
@@ -56,7 +56,7 @@ try {
   assert.equal(readPersonaText(file), '', '删掉之后读成空串');
 
   // ── 8. 真实角色卡：一字不丢 ──
-  const real = readFileSync('DSH_HOME/worlds/default/persona.md', 'utf8');
+  const real = readFileSync('C:/Users/80573/.dsh/worlds/default/persona.md', 'utf8');
   writePersonaText(file, real);
   const round = readPersonaText(file);
   assert.equal(round.trimEnd(), real.trimEnd(), '真实角色卡往返后不能少一个字');
