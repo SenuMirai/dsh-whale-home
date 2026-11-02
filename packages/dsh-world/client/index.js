@@ -799,6 +799,8 @@ function activityNote(r) {
       var filterState = useState('all'), traceFilter = filterState[0], setTraceFilter = filterState[1]
       var sortState = useState('activation'), traceSort = sortState[0], setTraceSort = sortState[1]
       var dayState = useState(''), traceDay = dayState[0], setTraceDay = dayState[1]
+      /** 记忆星图：应用内浮层。Electron 禁了 window.open 和跳转，只能自己嵌 iframe。 */
+      var atlasState = useState(false), atlasOpen = atlasState[0], setAtlasOpen = atlasState[1]
       function load() {
         fetch('/dsh-qq-group/world/traces', { cache: 'no-store' }).then(function (r) { return r.json() }).then(function (v) { setItems(list(v && v.traces)) }, function () { setItems([]) })
       }
@@ -816,7 +818,15 @@ function activityNote(r) {
       })
       var filterOptions = [['all', '全部'], ['owner', domainLabel('owner')], ['group', domainLabel('group')], ['work', domainLabel('work')]]
       return h('div', { className: 'dw-pane' },
-        h(Card, { title: '记忆', delay: 60 },
+atlasOpen ? h('div', { style: { position: 'fixed', left: 0, top: 0, width: '100%', height: '100%', zIndex: 90, background: '#030611' } }, h('iframe', { src: '/dsh-qq-group/world/atlas', title: '记忆星图', allow: 'fullscreen', allowFullScreen: true, style: { position: 'absolute', left: 0, top: 0, width: '100%', height: '100%', border: 0, display: 'block' } }), h('button', { title: '关闭星图', onClick: function () { setAtlasOpen(false) }, style: { position: 'absolute', right: '14px', bottom: '14px', zIndex: 95, width: '38px', height: '38px', borderRadius: '50%', border: '1px solid rgba(255,255,255,.22)', background: 'rgba(10,16,26,.62)', color: '#e8edf4', fontSize: '17px', lineHeight: '1', cursor: 'pointer', backdropFilter: 'blur(6px)' } }, '✕')) : null,
+                h(Card, { title: '记忆', delay: 60 },
+          h('div', { className: 'dw-setting', style: { marginBottom: '10px' } },
+            h('button', {
+              className: 'dw-btn',
+              style: { fontWeight: 600 },
+              onClick: function () { setAtlasOpen(true) }
+            }, '✦ 打开记忆星图'),
+            h('span', { className: 'dw-muted', style: { marginLeft: '10px' } }, '每一颗星是一条记忆：金色圈的是钉住的，亮的是常被想起的，暗的是正在淡去的。星图直接读这里的记忆，看到的就是最新的。')),
           h('div', { className: 'dw-muted' }, '她记得的所有事都在这里，一份。每条是「发生了什么」加「当时怎么想」。和主人的记忆影响她是谁，衰减最慢；群聊居中；工作掉得最快。被想起会变清楚。'),
           h('div', { className: 'dw-setting', style: { flexWrap: 'wrap', gap: '8px' } },
             filterOptions.map(function (pair) {

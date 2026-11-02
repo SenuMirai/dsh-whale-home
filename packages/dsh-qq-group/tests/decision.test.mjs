@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { decide, DECISIVE_P, DECISIVE_LEAD } from '../src/qq/decision.ts';
+import { decide, decideOnce, DECISIVE_P, DECISIVE_LEAD } from '../src/qq/decision.ts';
 
 // ── 一边倒：直接拍板，不摇骰子 ──
 {
@@ -69,6 +69,37 @@ import { decide, DECISIVE_P, DECISIVE_LEAD } from '../src/qq/decision.ts';
   );
   assert.equal(result.value, 'big');
   assert.ok(Math.abs(result.topP - 0.9) < 1e-9);
+}
+
+// ── decideOnce：极端概率不摇 ──
+{
+  let rolls = 0;
+  const random = () => {
+    rolls += 1;
+    return 0.5;
+  };
+  assert.deepEqual(decideOnce(0.95, random), { hit: true, decisive: true });
+  assert.deepEqual(decideOnce(0.05, random), { hit: false, decisive: true });
+  assert.equal(rolls, 0, '极端概率不该摇');
+}
+
+// ── decideOnce：中间地带要摇 ──
+{
+  let rolls = 0;
+  const random = () => {
+    rolls += 1;
+    return 0.1;
+  };
+  const result = decideOnce(0.5, random);
+  assert.equal(result.decisive, false);
+  assert.equal(result.hit, true);
+  assert.equal(rolls, 1);
+}
+
+// ── 边界值 0 和 1 ──
+{
+  assert.deepEqual(decideOnce(0, () => 0), { hit: false, decisive: true });
+  assert.deepEqual(decideOnce(1, () => 0.99), { hit: true, decisive: true });
 }
 
 // ── 抽样分布大致符合权重（固定种子不可用，只验证区间） ──

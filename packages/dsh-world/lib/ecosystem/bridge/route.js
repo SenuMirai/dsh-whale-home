@@ -18,8 +18,20 @@ async function handleSay(bridge, req, allowedHosts) {
         return { status: 403, body: { error: 'forbidden' } };
     const body = jsonObject(await readBody(req, MAX_BODY_BYTES));
     const text = typeof body?.text === 'string' ? body.text.trim() : '';
-    const length = [...text].length;
-    if (length < 1 || length > MAX_TEXT)
+    /**
+     * 2026-11-02 修：空文字检查要放在「解析图片之后」。
+     *
+     * 原来这里是 length < 1 就 400，而图片解析在下面几行 —— 于是纯图片消息
+     * （只发图、不打字）永远走不到图片那一步，直接被挡在门口。
+     * 主人今晚问的就是这个：以前能只发图，现在不能了。
+     *
+     * 现在的规则：
+     *   · 超长（> MAX_TEXT）→ 400，这条不变
+     *   · 空文字 + 有图      → 放行，正文空着送，图片照进
+     *   · 空文字 + 没图      → 400，确实没什么可送的
+     * 所以下面先把 images 解析出来，再一起判断。
+     */
+    if ([...text].length > MAX_TEXT)
         return bad;
     // bridge-images-patched
     // 图片：QQ 插件发来的是 data URL；转成 saveImages 认识的形状再交给桥。
@@ -39,8 +51,13 @@ async function handleSay(bridge, req, allowedHosts) {
             }
         }
     }
+    // 图片解析完了，现在才知道「空文字」是不是真的空：有图就不算空。
+    if ([...text].length < 1 && images.length === 0)
+        return bad;
     try {
-        const accepted = await bridge.say(text, images);
+        // 桌宠这类调用方会带 ticket；QQ 插件不传，就是空串，行为不变。
+        const ticket = typeof body?.ticket === 'string' ? body.ticket.slice(0, 120) : '';
+        const accepted = await bridge.say(text, images, ticket);
         return { status: 202, body: { accepted: true, id: accepted.id } };
     }
     catch (error) {

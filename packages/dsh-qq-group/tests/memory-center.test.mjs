@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -19,10 +20,8 @@ import {
   worldDiaryPath,
 } from '../src/qq/memory-center.ts';
 
-const BASE = join(process.cwd(), '.tmp-test-memory-center');
-mkdirSync(BASE, { recursive: true });
 function freshWorld() {
-  return mkdtempSync(join(BASE, 'w-'));
+  return mkdtempSync(join(tmpdir(), 'whale-memory-'));
 }
 
 // 1. 容量口径：首次读写种子，二次读文件；坏文件报错不兜底
@@ -139,5 +138,4 @@ function freshWorld() {
   assert.ok(readFileSync(join(dir, 'room', '待整理.md'), 'utf8').includes('一条素材'));
 }
 
-rmSync(BASE, { recursive: true, force: true });
 console.log('memory-center: all cases passed');

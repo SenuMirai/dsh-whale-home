@@ -24,6 +24,7 @@ import { BlockAssembler, createAssistantMessage, createUserMessage } from '@deep
 import type { GroupPolicy, QqConfig, QqRvcConfig } from './qq/config';
 import type { DiaryEntry, ProfileStore } from './qq/bridge';
 import type { ObSegment } from './qq/types';
+import { buildAtlasData } from './qq/atlas';
 import { runComputerTool } from './qq/computer';
 import { ComputerHost } from './qq/computer-host';
 import { readWorldBridge, readWorldMemory, syncWorldPermanent, syncWorldPersona, WorldRelay, writeWorldDiary, writeWorldPersona, writeWorldPrompt, writeWorldSelf } from './qq/world';
@@ -48,6 +49,14 @@ import {
   upsertTrace,
   writeTrace,
   type MemoryTrace,
+  pickDailyOldOnes,
+  loadHandoffs,
+  writeHandoff,
+  deleteHandoff,
+  loadUnresolved,
+  addUnresolved,
+  closeUnresolved,
+  reopenUnresolved,
 } from './qq/memory-traces';
 import {
   appendQqDiarySection,
@@ -3103,6 +3112,167 @@ ${recentPosts}`,
        * 老痕迹只有 createdAt（写入时刻），注入提示词时没带时间，
        * 她回忆起来就是一堆「无时间的孤立事实」。这里把 createdAt 复制过去。
        */
+      if (rest === 'world/atlas' && method === 'GET') {
+        try {
+          // PLUGIN_DIR 是 lib/ 所在目录；resources 在包的根上。
+          const file = join(PLUGIN_DIR, '..', 'resources', 'atlas.html');
+          const html = readFileSync(file, 'utf8');
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+          res.end(html);
+          return;
+        } catch (error) {
+          res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+          res.end(`星图页面读不到：${error instanceof Error ? error.message : String(error)}`);
+          return;
+        }
+      }
+
+      /**
+       * 星图的静态资源（three.js）。星图原来从 companion-memory 那边取，
+       * 那个服务已经不跑了，所以跟着插件一起发。
+       * 只放白名单里的几个文件，不做目录遍历。
+       */
+      if (rest.startsWith('world/atlas-assets/') && method === 'GET') {
+        const name = rest.slice('world/atlas-assets/'.length);
+        if (!/^[A-Za-z0-9._-]+\.js$/.test(name) || name.includes('..')) {
+          return send(404, { ok: false, message: '没有这个资源' });
+        }
+        try {
+          const file = join(PLUGIN_DIR, '..', 'resources', 'vendor', name);
+          const body = readFileSync(file);
+          res.writeHead(200, {
+            'content-type': 'text/javascript; charset=utf-8',
+            'cache-control': 'public, max-age=604800',
+          });
+          res.end(body);
+          return;
+        } catch {
+          return send(404, { ok: false, message: '资源读不到' });
+        }
+      }
+
+      if (rest === 'world/atlas-data' && method === 'GET') {
+        try {
+          const dir = traceStoreDir();
+          const settings = readSettings(root);
+          /**
+           * 核心卡 = 星图正中那个「原意识」。
+           *
+           * 2026-11-01 修：原来读的是 settings.persona?.card —— 那个字段根本不存在
+           * （settings.persona 是按 QQ 号存的旧映射），所以永远读出空串，
+           * 星图中间就显示「还没有核心卡」。改成走 activePersona()，
+           * 跟 QQ 插件实际在用的那张卡是同一张。
+           */
+          /**
+           * 星图上显示的名字。
+           *
+           * 先认 room/我是谁.md 里她自己写的真名（「我叫蓝星钥」）——
+           * 那是她自己定的名字，改了星图就跟着改。
+           * 没有这份文件时退回 QQ 配置里的 selfName（大肥鱼，群里叫的那个）。
+           *
+           * 注意：不能直接把 QQ 的 selfName 改成星钥 —— 那个字段还兼职
+           * 「群里被叫到名字要不要应」，改了会影响群里 @ 她的判定。
+           */
+          const name = (() => {
+            try {
+              const file = join(dir, 'room', '我是谁.md');
+              if (existsSync(file)) {
+                const text = readFileSync(file, 'utf8').replace(/\*\*/g, '');
+                // 先找「大家叫我星钥」这种短名，再找「我叫蓝星钥」的全名。
+                // 平时喊的是短的，星图上写短的更像她自己。
+                const short = /(?:大家)?叫我\s*([^\s。，、\n]{1,20})/u.exec(text);
+                if (short !== null && short[1] !== undefined && short[1].trim() !== '') return short[1].trim();
+                const hit = /我叫\s*([^\s。，、\n]{1,20})/u.exec(text);
+                if (hit !== null && hit[1] !== undefined && hit[1].trim() !== '') return hit[1].trim();
+              }
+            } catch {
+              /* 读不到就用下面的兜底 */
+            }
+            try {
+              const configured = readQqConfig(qqConfigPath(root)).config.selfName;
+              return typeof configured === 'string' && configured.trim() !== '' ? configured.trim() : '大肥鱼';
+            } catch {
+              return '大肥鱼';
+            }
+          })();
+          const data = buildAtlasData(loadTraces(dir), {
+            displayName: name,
+            coreCard: activePersona(settings),
+          });
+          data.counts.links = data.links.length;
+          data.counts.handoffs = loadHandoffs(dir).length;
+          data.counts.unresolved = loadUnresolved(dir).filter((item) => item.closedAt === undefined).length;
+          return send(200, data);
+        } catch (error) {
+          return send(500, { ok: false, message: `星图数据生成失败：${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
+
+      if (rest === 'world/handoff') {
+        const dir = traceStoreDir();
+        if (method === 'GET') {
+          return send(200, { ok: true, items: loadHandoffs(dir) });
+        }
+        if (method !== 'POST') return send(405, { error: 'method not allowed' });
+        const payload = JSON.parse(body || 'null') as Record<string, unknown> | null;
+        if (payload === null) return send(400, { ok: false, message: '空请求' });
+        if (payload.action === 'delete') {
+          const id = typeof payload.id === 'string' ? payload.id : '';
+          if (id === '') return send(400, { ok: false, message: '缺少 id' });
+          return send(200, { ok: true, items: deleteHandoff(dir, id) });
+        }
+        const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+        if (text === '') return send(400, { ok: false, message: '便签不能是空的' });
+        const created = writeHandoff(dir, {
+          text,
+          mood: typeof payload.mood === 'string' ? payload.mood : undefined,
+          nextTime: typeof payload.nextTime === 'string' ? payload.nextTime : undefined,
+          where: typeof payload.where === 'string' ? payload.where : undefined,
+        });
+        return send(200, { ok: true, item: created, items: loadHandoffs(dir) });
+      }
+
+      if (rest === 'world/unresolved') {
+        const dir = traceStoreDir();
+        if (method === 'GET') {
+          return send(200, { ok: true, items: loadUnresolved(dir) });
+        }
+        if (method !== 'POST') return send(405, { error: 'method not allowed' });
+        const payload = JSON.parse(body || 'null') as Record<string, unknown> | null;
+        if (payload === null) return send(400, { ok: false, message: '空请求' });
+        const id = typeof payload.id === 'string' ? payload.id : '';
+        if (payload.action === 'close') {
+          if (id === '') return send(400, { ok: false, message: '缺少 id' });
+          const result = typeof payload.result === 'string' ? payload.result : undefined;
+          return send(200, { ok: true, items: closeUnresolved(dir, id, result) });
+        }
+        if (payload.action === 'reopen') {
+          if (id === '') return send(400, { ok: false, message: '缺少 id' });
+          return send(200, { ok: true, items: reopenUnresolved(dir, id) });
+        }
+        const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+        if (text === '') return send(400, { ok: false, message: '内容不能是空的' });
+        const importance = typeof payload.importance === 'number' ? payload.importance : undefined;
+        const created = addUnresolved(dir, { text, importance });
+        return send(200, { ok: true, item: created, items: loadUnresolved(dir) });
+      }
+
+      if (rest === 'world/semantic') {
+        const dir = traceStoreDir();
+        if (method === 'GET') {
+          return send(200, { ok: true, items: loadSemantic(dir) });
+        }
+        if (method !== 'POST') return send(405, { error: 'method not allowed' });
+        const payload = JSON.parse(body || 'null') as Record<string, unknown> | null;
+        if (payload === null) return send(400, { ok: false, message: '空请求' });
+        const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+        if (text === '') return send(400, { ok: false, message: '结论不能是空的' });
+        const from = Array.isArray(payload.from) ? payload.from.map(String) : [];
+        const importance = typeof payload.importance === 'number' ? payload.importance : undefined;
+        const merged = mergeSemantic(dir, [{ text, from, importance }], Date.now());
+        return send(200, { ok: true, ...merged, items: loadSemantic(dir) });
+      }
+
       if (rest === 'world/traces-catchup' && method === 'POST') {
         const dir = traceStoreDir();
         if (dir === '') return send(200, { ok: false, message: '世界桥没开或没配目录' });

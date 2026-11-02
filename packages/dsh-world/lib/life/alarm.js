@@ -75,7 +75,8 @@ export function wakeText(alarm, now, timeZone, fallbackWakeTime, messages = read
     const base = { ...extra, timeZone, fallbackWakeTime };
     const lateText = lateNotice(now.getTime() - Date.parse(alarm.at), messages, base);
     const body = alarm.source === 'fallback' ? fillMessage(messages, '早上兜底', { ...base, late: lateText })
-        : fillMessage(messages, '闹钟响了', { ...base, time: formatLocalTime(new Date(alarm.at), timeZone), note: alarm.note, late: lateText }, { note: Boolean(alarm.note), did: Boolean(extra.did) });
+        : alarm.source === 'daylight' ? fillMessage(messages, '白天兜底', { ...base, time: formatLocalTime(now, timeZone).slice(11, 16), late: lateText })
+            : fillMessage(messages, '闹钟响了', { ...base, time: formatLocalTime(new Date(alarm.at), timeZone), note: alarm.note, late: lateText }, { note: Boolean(alarm.note), did: Boolean(extra.did) });
     return withTail(body, messages, base);
 }
 /** What a new home says the moment it is built, or her home when her world starts again. */

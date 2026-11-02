@@ -166,12 +166,30 @@ export function mergeConfigPatch(current: QqConfig, patch: unknown): QqConfig {
   return normalizeConfig(deepMerge(current, src) as Record<string, unknown>);
 }
 
+/**
+ * 深合并配置补丁。
+ *
+ * 2026-11-02：`null` 现在表示**删掉这个键**，不再只是把它置空。
+ *
+ * 为什么改：设置页要加「删除群聊 / 删除私聊」的按钮。原先传
+ * `{ qq: { groups: { 123: null } } }` 时，这行会走 `return over`（返回 null），
+ * 于是 `out.groups["123"] = null`，键还留在对象里；接着 normalizeConfig 的
+ * `for (const [gid, value] of Object.entries(...))` 又把 null 当成一份空策略去
+ * 归一化，结果是"删了等于没删"。
+ *
+ * 现在遇到 null 直接把键从结果里去掉。其余值照旧递归合并。
+ */
 function deepMerge(base: unknown, over: unknown): unknown {
-  if (over === null || typeof over !== 'object' || Array.isArray(over)) return over;
+  if (over === null) return null;
+  if (typeof over !== 'object' || Array.isArray(over)) return over;
   const b =
     base !== null && typeof base === 'object' && !Array.isArray(base) ? (base as Record<string, unknown>) : {};
   const out: Record<string, unknown> = { ...b };
   for (const [key, value] of Object.entries(over as Record<string, unknown>)) {
+    if (value === null) {
+      delete out[key];
+      continue;
+    }
     out[key] = deepMerge(b[key], value);
   }
   return out;

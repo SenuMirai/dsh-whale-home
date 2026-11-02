@@ -205,7 +205,33 @@ export async function apply(ctx, config) {
                 life = current;
                 isHome = current.isHome;
                 if (config.bridge) {
-                    bridge = createBridge({ ctx: lifeCtx, home: () => current.home(), outlets, origin: () => host.origin(), file: join(worldDir, 'bridge.json'), name: names().companion });
+                    bridge = createBridge({ ctx: lifeCtx, home: () => current.home(), outlets, origin: () => host.origin(), file: join(worldDir, 'bridge.json'), name: names().companion, 
+                        /**
+                         * 语音合成：交给 QQ 插件那套（GPT-SoVITS 七音色 + 情绪）。
+                         *
+                         * 为什么不在这里做：她说话的声音只有一套，配在 QQ 插件里。
+                         * 世界只负责「让谁来说」，不重复维护一份音色表。
+                         * 失败就返回 undefined —— 桥那边会退回纯文字，不影响投递。
+                         */
+                        synthesize: async (text) => {
+                            try {
+                                const base = (host.origin() ?? '').replace(/\/$/, '');
+                                if (base === '') return undefined;
+                                const response = await fetch(`${base}/dsh-qq-group/tts`, {
+                                    method: 'POST',
+                                    headers: { 'content-type': 'application/json' },
+                                    body: JSON.stringify({ text }),
+                                    signal: AbortSignal.timeout(60_000),
+                                });
+                                if (!response.ok) return undefined;
+                                const body = await response.json();
+                                if (body?.ok !== true || typeof body.audio !== 'string') return undefined;
+                                return { data: body.audio, mime: typeof body.mime === 'string' ? body.mime : 'audio/wav' };
+                            }
+                            catch {
+                                return undefined;
+                            }
+                        } });
                     bridge.start();
                 }
                 if (config.wechat && power.wechatEnabled())

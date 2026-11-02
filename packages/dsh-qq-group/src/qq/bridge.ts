@@ -1195,9 +1195,37 @@ export class QqBridge {
       // 私聊进家只带「你自己说的」这句 + 引用 + 语音转写。
       // 群里的实时消息不再拼进正文：她要知道群里的事，读 room/群近况.md（记忆中心那份），
       // 两边共用同一份，而不是往会话里塞一条假消息。
-      const worldText = [quoted, voiceNote, message.text]
-        .filter((part) => part !== '')
-        .join('\n');
+      /**
+       * 2026-11-02：这行原来完全没有边界，是 400 的来源之一。
+       *
+       * dsh-world 的入口（ecosystem/bridge/route.js）要求
+       * `[...text].length` 在 1..2000 之间，否则 400。
+       * 引用上限 1000，正文和语音转写都没有上限，三样叠起来能越过 2000。
+       *
+       * 超长时优先保住「他自己说的最后一段」，从引用那头开始砍：
+       * 引用是背景，正文才是他真正要说的话。
+       * 用 [...s].length 数字符而不是 s.length，跟对方口径一致（emoji 算一个字）。
+       *
+       * 注意：**空文字不再在这里编占位句**。
+       * world 的桥现在已经能收纯图片消息（text 可以为空，只要带了 images），
+       * 编一句「（只发了图片，没有文字）」发过去，她会看到一句假话、却看不到那张图 ——
+       * 那比报错更糟，因为它骗她说有过了。
+       */
+      const MAX_BRIDGE_CHARS = 2000;
+      const parts = [quoted, voiceNote, message.text].filter((part) => part.trim() !== '');
+      let worldText = parts.join('\n');
+      if ([...worldText].length > MAX_BRIDGE_CHARS) {
+        const kept = [...parts];
+        while (kept.length > 1 && [...kept.join('\n')].length > MAX_BRIDGE_CHARS) kept.shift();
+        worldText = [...kept.join('\n')].slice(0, MAX_BRIDGE_CHARS).join('');
+        this.log('warn', `私聊正文超过 ${MAX_BRIDGE_CHARS} 字，已截断（原 ${[...parts.join('\n')].length} 字）`);
+      }
+      // 纯图片 / 纯表情：正文空着交给桥，图片由 worldImages 带着走。
+      // 只有「既没字也没图也没语音也没引用」时才真的没什么可送。
+      if (worldText.trim() === '' && worldImages.length === 0) {
+        this.log('info', `私聊 ${userId} 没有可送的内容（无文字、无图），跳过`);
+        return;
+      }
       /**
        * 先记账，再交接。
        *
@@ -2927,8 +2955,29 @@ export class QqBridge {
     }
 
     // 文字：按连发配置发（模型给的条数优先，但不超过策略上限）
+    /**
+     * 2026-11-02 修：这里原来是 plan.messages.slice(0, limit)，超出的**直接丢弃**。
+     *
+     * 症状：她在 DSH 里发 4 条，QQ 只到 3 条，第 4 条无声消失。
+     * 两层帽子叠加：分条阶段 cap=6 保留了她说的 4 条，
+     * 这里的 burst.max=3 又把第 4 条砍掉 —— 主人看到的就是「少了」。
+     *
+     * 现在：超出上限的条目不再丢弃，并进最后一条（换行连接），
+     * 和分条阶段 chunks.length > cap 的处理方式一致。
+     * burst.max 已提到 6（主人私聊 3→6，默认私聊 5→6），
+     * 正常情况碰不到这道保险丝；碰到时宁可挤成一条，也不丢她的话。
+     */
     const limit = Math.max(1, policy.burst.max);
-    const messages = plan.messages.slice(0, limit);
+    let messages = plan.messages.slice(0, limit);
+    if (plan.messages.length > limit) {
+      const overflow = plan.messages.slice(limit).join('\n');
+      if (overflow.trim() !== '') {
+        const lastIdx = limit - 1;
+        const merged = [messages[lastIdx], overflow].filter((s) => s && s.trim() !== '').join('\n');
+        messages = [...messages.slice(0, lastIdx), merged];
+        this.log('warn', `一轮想发 ${plan.messages.length} 条，上限 ${limit}，超出部分已并进最后一条`);
+      }
+    }
     /**
      * @主人 放在最后一条的末尾。
      *

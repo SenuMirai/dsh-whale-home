@@ -1,6 +1,56 @@
-# Inserts the dsh-world row enabled: with no config it serves the standard preset as a world named
-# "default" in the system time zone. Override the row by id in a profile to name the companion, pick
-# another preset or turn on the life line (see README).
+# dsh-world 的加载补丁
+#
+# 这个文件决定 dsh-world 怎么被插进 DSH 的插件树。下面每一项都对应一个
+# 实际踩过的坑，不是随手写的默认值。
+#
+# ── agentPreset ──────────────────────────────────────────────────────
+#   world 判断一个会话属不属于她的世界，看的是 header.agentPreset 是否等于
+#   这个值（见 sourceArchive.js 的 belongsToWorld），跟 cwd 无关。
+#   默认是 standard。如果你的家会话用的是别的预设（比如 wish），这里不改
+#   就会一直报「家打不开：会话不在世界工作区内」。
+#   → 改成你实际在用的预设名。
+#
+# ── companionName ────────────────────────────────────────────────────
+#   她的名字。不给的话界面就显示 "TA"。
+#   → 改成你想要的名字。
+#
+# ── bridge ───────────────────────────────────────────────────────────
+#   默认 false。关着的时候 world 不写 <world>/bridge.json，dsh-qq-group
+#   那边就找不到「家」的地址，QQ 私聊没法交给 DSH 会话里的她。
+#   表现：QQ 面板写「bridge.json 不存在；dsh-world 还没启动或没开 bridge」。
+#   → 要用 QQ 私聊就必须打开。
+#
+# ── outlets ──────────────────────────────────────────────────────────
+#   这是**回程**。bridge: true 只让消息「进得去」，她要说话还得有个出口
+#   推回 QQ 私聊，否则你只会看到她在 DSH 会话里回你，QQ 那头一片空白。
+#
+#   注意 url 里的 {origin}：world 每次推送前都会把它替换成当前 DSH 的地址
+#   （见 outlets.js 的 outletUrl）。**不要写死端口**——每次重启都会变。
+#
+#   kinds 三个都要：
+#     reply  她回你的话
+#     busy   她正忙时的提示
+#     reach  她主动找你
+#
+#   如果不用 dsh-qq-group，把这一段整块删掉即可，不影响其他功能。
+#
+# ── 关于 QQ 通道 ─────────────────────────────────────────────────────
+#   ecosystem/qq 对接的是 SnowLuma 面板，和 dsh-qq-group 是两套独立实现。
+#   用 dsh-qq-group 的话，控制台里「QQ 通道未开启」是预期状态，不用管。
 - insert:
     - id: dsh-world
       name: dsh-world
+      config:
+        # ↓ 改成你家会话实际用的预设名
+        agentPreset: standard
+        # ↓ 改成你想要的名字
+        companionName: 鲸鱼娘
+        # 要用 QQ 私聊就开；不用可以删掉这一段
+        bridge: true
+        outlets:
+          - name: qq
+            url: '{origin}/dsh-qq-group/world/outlet'
+            kinds:
+              - reply
+              - busy
+              - reach

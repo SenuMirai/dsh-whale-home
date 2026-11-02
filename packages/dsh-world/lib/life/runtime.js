@@ -81,7 +81,23 @@ export function createLifeRuntime(deps) {
         return alarm && { kind: 'alarm', at: alarm.at, alarm };
     }
     const timer = createAlarmTimer({ clock, timers: deps.timers ?? realTimers, dueAlarm: () => nextJob()?.at, fire: () => void deliver() });
-    const morning = (now) => ({ at: nextLocalTime(now, options.fallbackWakeTime, timeZone).toISOString(), note: '', setAt: now.toISOString(), source: 'fallback' });
+    /**
+     * 兜底闹钟排到什么时候。
+     *
+     * 2026-10-30 改：以前无论几点，兜底一律排到「明早 fallbackWakeTime」。
+     * 结果她 11:30 醒来一次、没定计划，下一次就是第二天 —— 一天只有一次机会，
+     * 想自己过日子也没地方过。白天改成 90 分钟后再看一次，跟心跳一样；
+     * 晚上十一点以后才照旧睡到明早。
+     */
+    const DAY_HEARTBEAT_MINUTES = 90;
+    function fallbackSchedule(now) {
+        const hour = Number(formatLocalTime(now, timeZone).slice(11, 13));
+        const awake = Number.isFinite(hour) && hour >= 8 && hour < 23;
+        return awake
+            ? { at: new Date(now.getTime() + DAY_HEARTBEAT_MINUTES * 60_000).toISOString(), source: 'daylight' }
+            : { at: nextLocalTime(now, options.fallbackWakeTime, timeZone).toISOString(), source: 'fallback' };
+    }
+    const morning = (now) => ({ ...fallbackSchedule(now), note: '', setAt: now.toISOString() });
     /** A new alarm replaces a failing one, so its backoff and fault go with it. Saved or not, it is armed. */
     function setAlarm(alarm) {
         if (stopped)

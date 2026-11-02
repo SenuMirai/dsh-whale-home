@@ -1624,6 +1624,46 @@ window.__ModuleLoader__.load({
         }
       };
 
+
+      /**
+       * 删除一个群 / 私聊。
+       *
+       * 后端 qq-host 的 deepMerge 认 null = 删掉这个键（2026-11-02 改的），
+       * 所以这里传 { groups: { [id]: null } } 就真的从配置里移除。
+       *
+       * 加确认：这是配置销毁动作，误点一次那个群就再也不说话了，
+       * 而"不说话"很难被立刻发现——不确认的话可能几天后才反应过来。
+       */
+      const deleteSession = async function (kind, id, label) {
+        const isGroup = kind === 'group';
+        if (!window.confirm('确定要删除' + (isGroup ? '群 ' : '私聊 ') + label + ' 吗？\n\n' + '删除后它不会再出现在列表里，也不会再收到任何回复。')) {
+          return;
+        }
+        setBusy(true);
+        setMessage('');
+        try {
+          const body = isGroup
+            ? { qq: { groups: { [id]: null } } }
+            : { qq: { privates: { [id]: null } } };
+          const r = await fetch(BASE + '/config', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const j = await r.json().catch(function () { return {}; });
+          if (j && j.ok === false) {
+            setMessage('删除失败：' + (j.message || '未知原因'));
+          } else {
+            await loadConfig();
+            setMessage((isGroup ? '群 ' : '私聊 ') + label + ' 已删除');
+          }
+        } catch (e) {
+          setMessage('删除失败：' + (e && e.message ? e.message : String(e)));
+        } finally {
+          setBusy(false);
+        }
+      };
+
       const toggleGroupEnabled = async function (id, enabled) {
         const current = groups[id];
         if (!current) return;
@@ -1883,6 +1923,8 @@ window.__ModuleLoader__.load({
             h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
               groupIds.map(function (id) {
                 const item = groups[id] || {};
+                // 名字优先级：NapCat 拉回来的 > 配置里存的 > 群号本身
+                const nm = (sessionNames.groups && sessionNames.groups[id]) || item.name || id;
                 return h('label', { key: id, style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' } },
                   h('input', {
                     type: 'checkbox',
@@ -1890,11 +1932,20 @@ window.__ModuleLoader__.load({
                     disabled: busy,
                     onChange: function (e) { void toggleGroupEnabled(id, e.target.checked); },
                   }),
-                  h('span', { children: '群 ' + (item.name || id) + '（' + id + '）' }),
+                  h('span', { style: { flex: '1' }, children: nm + '（群 ' + id + '）' }),
+                  h('button', {
+                    type: 'button',
+                    title: '从列表删除这个群',
+                    disabled: busy,
+                    style: { border: 'none', background: 'transparent', cursor: 'pointer', opacity: 0.55, fontSize: '13px', padding: '0 4px' },
+                    onClick: function (e) { e.preventDefault(); e.stopPropagation(); void deleteSession('group', id, nm); },
+                    children: '✕',
+                  }),
                 );
               }),
               privateIds.map(function (qq) {
                 const item = privates[qq] || {};
+                const nm = (sessionNames.privates && sessionNames.privates[qq]) || item.name || qq;
                 return h('label', { key: 'p:' + qq, style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' } },
                   h('input', {
                     type: 'checkbox',
@@ -1902,7 +1953,15 @@ window.__ModuleLoader__.load({
                     disabled: busy,
                     onChange: function (e) { void togglePrivateEnabled(qq, e.target.checked); },
                   }),
-                  h('span', { children: '私聊 ' + (item.name || qq) + '（' + qq + '）' }),
+                  h('span', { style: { flex: '1' }, children: nm + '（私聊 ' + qq + '）' }),
+                  h('button', {
+                    type: 'button',
+                    title: '从列表删除这个私聊',
+                    disabled: busy,
+                    style: { border: 'none', background: 'transparent', cursor: 'pointer', opacity: 0.55, fontSize: '13px', padding: '0 4px' },
+                    onClick: function (e) { e.preventDefault(); e.stopPropagation(); void deleteSession('private', qq, nm); },
+                    children: '✕',
+                  }),
                 );
               }),
             ),
