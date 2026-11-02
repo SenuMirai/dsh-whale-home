@@ -2050,6 +2050,47 @@ export class QqBridge {
   }
 
   /** 从 QQ 图片段下载最多 2 张，转成可以交给 DSH 视觉模型的字节 */
+  /**
+   * 按魔数认图片格式。
+   *
+   * 2026-11-02 加。起因：主人说她看不了动图了。
+   *
+   * DSH 的附件层有条硬规定——「Declared media type, verified against the
+   * decoded bytes during admission」：声明的 MIME 必须和实际字节一致，
+   * 不一致直接拒收，而且不报错、不降级，图就是没了。
+   *
+   * 这里原来三条取图分支各行其是：
+   *   · 本地路径 → 按扩展名猜，gif 落到 else 变成 image/jpeg   ✗
+   *   · base64   → 硬编码 image/jpeg                          ✗
+   *   · http     → 嗅探魔数，但优先信任响应头的 content-type  半对
+   *
+   * 所以 GIF 只要不是走"干净的 http + 正确的 content-type"，就会被标成
+   * jpeg → 附件层验字节不过 → 拒收。表现是她收到文字、看不到图，
+   * 日志里只有一句「图片没能存成附件」。
+   *
+   * 现在统一走这里：只看字节。扩展名和 content-type 都只当参考，
+   * 因为最终核验的是字节，这里就先按字节说话。
+   */
+  private sniffImageMediaType(bytes: Uint8Array): string {
+    if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+      return 'image/png';
+    }
+    if (bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+      return 'image/gif'; // "GIF" —— 动图走这条
+    }
+    if (
+      bytes.length >= 12 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+    ) {
+      return 'image/webp';
+    }
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return 'image/jpeg';
+    }
+    return '';
+  }
+
   private async downloadChatImages(message: GroupMessage): Promise<ChatImage[]> {
     let segments = message.images;
     if (segments.length === 0 && message.replyToId !== undefined) {
@@ -2076,9 +2117,12 @@ export class QqBridge {
           const local = url.startsWith('file://') ? decodeURIComponent(url.slice('file://'.length)) : url;
           const bytes = readFileSync(local);
           if (bytes.byteLength > 0 && bytes.byteLength <= 4 * 1024 * 1024) {
-            const ext = (local.split('.').pop() ?? 'jpg').toLowerCase();
-            const mediaType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-            images.push({ data: new Uint8Array(bytes), mediaType, name: `qq-local-${Date.now()}.${ext}` });
+            // 认字节不认扩展名：NapCat 缓存的 gif 常被存成 .jpg 或根本没有扩展名。
+            const mediaType = this.sniffImageMediaType(new Uint8Array(bytes));
+            if (mediaType !== '') {
+              const ext = mediaType.split('/')[1].replace('jpeg', 'jpg');
+              images.push({ data: new Uint8Array(bytes), mediaType, name: `qq-local-${Date.now()}.${ext}` });
+            }
           }
         } catch {
           /* 本地路径读不到就继续尝试其他来源 */
@@ -2089,7 +2133,11 @@ export class QqBridge {
         try {
           const bytes = Buffer.from(url.slice('base64://'.length), 'base64');
           if (bytes.byteLength > 0 && bytes.byteLength <= 4 * 1024 * 1024) {
-            images.push({ data: new Uint8Array(bytes), mediaType: 'image/jpeg', name: `qq-quoted-${Date.now()}.jpg` });
+            const mediaType = this.sniffImageMediaType(new Uint8Array(bytes));
+            if (mediaType !== '') {
+              const ext = mediaType.split('/')[1].replace('jpeg', 'jpg');
+              images.push({ data: new Uint8Array(bytes), mediaType, name: `qq-quoted-${Date.now()}.${ext}` });
+            }
           }
         } catch {
           /* ignore */
@@ -2110,9 +2158,16 @@ export class QqBridge {
           bytes.length >= 12 &&
           bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
           bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50;
-        const mediaType = /^image\//i.test(declaredType)
-          ? declaredType
-          : isPng ? 'image/png' : isGif ? 'image/gif' : isWebp ? 'image/webp' : isJpeg ? 'image/jpeg' : '';
+        /**
+         * 嗅探优先，声明的 content-type 只在嗅探失败时兜底。
+         *
+         * 原来反过来（declaredType 优先）。碰上 CDN 把 gif 标成 image/jpeg、
+         * 或者直接给 application/octet-stream，就会和实际字节对不上，
+         * 附件层拒收——图和动图一起没了。
+         * 附件层反正要按字节核验，这里就按字节说话。
+         */
+        const sniffed = this.sniffImageMediaType(bytes);
+        const mediaType = sniffed !== '' ? sniffed : (/^image\//i.test(declaredType) ? declaredType : '');
         if (mediaType === '') continue;
         images.push({ data: bytes, mediaType, name: `qq-image-${Date.now()}.${mediaType.split('/')[1] ?? 'jpg'}` });
       } catch (e) {

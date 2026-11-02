@@ -9589,6 +9589,42 @@ ${result.text}
     return asksOpinion && (refersToHer || aboutImage);
   }
   /** 从 QQ 图片段下载最多 2 张，转成可以交给 DSH 视觉模型的字节 */
+  /**
+   * 按魔数认图片格式。
+   *
+   * 2026-11-02 加。起因：主人说她看不了动图了。
+   *
+   * DSH 的附件层有条硬规定——「Declared media type, verified against the
+   * decoded bytes during admission」：声明的 MIME 必须和实际字节一致，
+   * 不一致直接拒收，而且不报错、不降级，图就是没了。
+   *
+   * 这里原来三条取图分支各行其是：
+   *   · 本地路径 → 按扩展名猜，gif 落到 else 变成 image/jpeg   ✗
+   *   · base64   → 硬编码 image/jpeg                          ✗
+   *   · http     → 嗅探魔数，但优先信任响应头的 content-type  半对
+   *
+   * 所以 GIF 只要不是走"干净的 http + 正确的 content-type"，就会被标成
+   * jpeg → 附件层验字节不过 → 拒收。表现是她收到文字、看不到图，
+   * 日志里只有一句「图片没能存成附件」。
+   *
+   * 现在统一走这里：只看字节。扩展名和 content-type 都只当参考，
+   * 因为最终核验的是字节，这里就先按字节说话。
+   */
+  sniffImageMediaType(bytes) {
+    if (bytes.length >= 4 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71) {
+      return "image/png";
+    }
+    if (bytes.length >= 3 && bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70) {
+      return "image/gif";
+    }
+    if (bytes.length >= 12 && bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80) {
+      return "image/webp";
+    }
+    if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) {
+      return "image/jpeg";
+    }
+    return "";
+  }
   async downloadChatImages(message) {
     let segments = message.images;
     if (segments.length === 0 && message.replyToId !== void 0) {
@@ -9612,9 +9648,11 @@ ${result.text}
           const local = url.startsWith("file://") ? decodeURIComponent(url.slice("file://".length)) : url;
           const bytes = readFileSync14(local);
           if (bytes.byteLength > 0 && bytes.byteLength <= 4 * 1024 * 1024) {
-            const ext = (local.split(".").pop() ?? "jpg").toLowerCase();
-            const mediaType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
-            images.push({ data: new Uint8Array(bytes), mediaType, name: `qq-local-${Date.now()}.${ext}` });
+            const mediaType = this.sniffImageMediaType(new Uint8Array(bytes));
+            if (mediaType !== "") {
+              const ext = mediaType.split("/")[1].replace("jpeg", "jpg");
+              images.push({ data: new Uint8Array(bytes), mediaType, name: `qq-local-${Date.now()}.${ext}` });
+            }
           }
         } catch {
         }
@@ -9624,7 +9662,11 @@ ${result.text}
         try {
           const bytes = Buffer.from(url.slice("base64://".length), "base64");
           if (bytes.byteLength > 0 && bytes.byteLength <= 4 * 1024 * 1024) {
-            images.push({ data: new Uint8Array(bytes), mediaType: "image/jpeg", name: `qq-quoted-${Date.now()}.jpg` });
+            const mediaType = this.sniffImageMediaType(new Uint8Array(bytes));
+            if (mediaType !== "") {
+              const ext = mediaType.split("/")[1].replace("jpeg", "jpg");
+              images.push({ data: new Uint8Array(bytes), mediaType, name: `qq-quoted-${Date.now()}.${ext}` });
+            }
           }
         } catch {
         }
@@ -9641,7 +9683,8 @@ ${result.text}
         const isPng = bytes.length >= 4 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71;
         const isGif = bytes.length >= 3 && bytes[0] === 71 && bytes[1] === 73 && bytes[2] === 70;
         const isWebp = bytes.length >= 12 && bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70 && bytes[8] === 87 && bytes[9] === 69 && bytes[10] === 66 && bytes[11] === 80;
-        const mediaType = /^image\//i.test(declaredType) ? declaredType : isPng ? "image/png" : isGif ? "image/gif" : isWebp ? "image/webp" : isJpeg ? "image/jpeg" : "";
+        const sniffed = this.sniffImageMediaType(bytes);
+        const mediaType = sniffed !== "" ? sniffed : /^image\//i.test(declaredType) ? declaredType : "";
         if (mediaType === "") continue;
         images.push({ data: bytes, mediaType, name: `qq-image-${Date.now()}.${mediaType.split("/")[1] ?? "jpg"}` });
       } catch (e) {
